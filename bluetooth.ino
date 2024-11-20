@@ -1,0 +1,230 @@
+#define CAMERA_MODEL_XIAO_ESP32S3
+#include <I2S.h>
+#include <BLE2902.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include "mulaw.h"
+
+// Device and Service UUIDs
+#define DEVICE_NAME "ESP32WAV"
+static BLEUUID serviceUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
+static BLEUUID audioCharacteristicUUID("beb5483e-36e1-4688-b7f5-ea07361b26a8");
+
+// Audio codec configuration
+#define CODEC_PCM
+
+// Fixed frame size for consistent buffering
+#define FRAME_SIZE 160
+#define SAMPLE_RATE 16000
+#define SAMPLE_BITS 16
+
+// BLE characteristic and connection state
+BLECharacteristic *audioCharacteristic;
+bool connected = false;
+uint16_t audio_frame_count = 0;
+
+// Fixed buffer sizes based on frame size
+static size_t recording_buffer_size = FRAME_SIZE * 2;  // 160 samples * 2 bytes per sample
+static size_t compressed_buffer_size = FRAME_SIZE * 2 + 3;  // Audio data + 3-byte header
+
+#define VOLUME_GAIN 2
+
+static uint8_t *s_recording_buffer = nullptr;
+static uint8_t *s_compressed_frame = nullptr;
+
+// Timing control
+unsigned long last_frame_time = 0;
+unsigned long last_stats_time = 0;
+const unsigned long FRAME_INTERVAL = 10; // 10ms = 160 samples at 16kHz
+const unsigned long STATS_INTERVAL = 1000; // Print stats every second
+
+// Statistics
+unsigned long frames_sent = 0;
+unsigned long last_frames_sent = 0;
+unsigned long bytes_read = 0;
+unsigned long bytes_sent = 0;
+unsigned long frame_overruns = 0;
+unsigned long frame_underruns = 0;
+
+// Forward declaration of printStats
+void printStats();
+
+class ServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* server) {
+        connected = true;
+        audio_frame_count = 0;
+        last_frame_time = millis();
+        last_stats_time = millis();
+        frames_sent = 0;
+        last_frames_sent = 0;
+        bytes_read = 0;
+        bytes_sent = 0;
+        frame_overruns = 0;
+        frame_underruns = 0;
+        Serial.println("\n=== Client Connected ===");
+        Serial.println("Resetting all counters");
+    }
+
+    void onDisconnect(BLEServer* server) {
+        connected = false;
+        Serial.println("\n=== Client Disconnected ===");
+        Serial.println("Final Statistics:");
+        printStats();
+        BLEDevice::startAdvertising();
+    }
+};
+
+void printStats() {
+    unsigned long current_time = millis();
+    float elapsed_time = (current_time - last_stats_time) / 1000.0;
+    unsigned long frames_this_period = frames_sent - last_frames_sent;
+    float current_frame_rate = frames_this_period / elapsed_time;
+    
+    Serial.println("\n=== Audio Streaming Stats ===");
+    Serial.printf("Time elapsed: %.1f seconds\n", elapsed_time);
+    Serial.printf("Current frame rate: %.1f fps\n", current_frame_rate);
+    Serial.printf("Total frames sent: %lu\n", frames_sent);
+    Serial.printf("Bytes read: %lu\n", bytes_read);
+    Serial.printf("Bytes sent: %lu\n", bytes_sent);
+    Serial.printf("Frame overruns: %lu\n", frame_overruns);
+    Serial.printf("Frame underruns: %lu\n", frame_underruns);
+    Serial.printf("Buffer sizes - Recording: %u, Compressed: %u\n", recording_buffer_size, compressed_buffer_size);
+    Serial.printf("Last frame interval: %lu ms\n", current_time - last_frame_time);
+    Serial.println("============================\n");
+
+    last_frames_sent = frames_sent;
+    last_stats_time = current_time;
+}
+
+void configure_ble() {
+    BLEDevice::init(DEVICE_NAME);
+    BLEServer *server = BLEDevice::createServer();
+    server->setCallbacks(new ServerCallbacks());
+
+    // Create main service
+    BLEService *service = server->createService(serviceUUID);
+
+    // Create audio characteristic
+    audioCharacteristic = service->createCharacteristic(
+        audioCharacteristicUUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    
+    BLE2902 *ccc = new BLE2902();
+    ccc->setNotifications(true);
+    audioCharacteristic->addDescriptor(ccc);
+
+    // Start the service
+    service->start();
+
+    // Start advertising
+    BLEAdvertising *advertising = BLEDevice::getAdvertising();
+    advertising->addServiceUUID(serviceUUID);
+    advertising->setScanResponse(true);
+    advertising->setMinPreferred(0x06);
+    advertising->setMaxPreferred(0x12);
+    
+    BLEDevice::startAdvertising();
+    Serial.println("BLE service started");
+    Serial.printf("Audio configuration: %dHz, %d-bit, Frame size: %d samples\n", 
+                 SAMPLE_RATE, SAMPLE_BITS, FRAME_SIZE);
+}
+
+void configure_microphone() {
+    Serial.println("Configuring microphone...");
+    // Configure I2S with explicit PDM settings
+    I2S.setAllPins(-1, 42, 41, -1, -1);
+    
+    if (!I2S.begin(PDM_MONO_MODE, SAMPLE_RATE, SAMPLE_BITS)) {
+        Serial.println("Failed to initialize I2S!");
+        while (1); // do nothing
+    }
+
+    // Allocate buffers
+    s_recording_buffer = (uint8_t *) ps_calloc(recording_buffer_size, sizeof(uint8_t));
+    s_compressed_frame = (uint8_t *) ps_calloc(compressed_buffer_size, sizeof(uint8_t));
+    
+    if (!s_recording_buffer || !s_compressed_frame) {
+        Serial.println("Failed to allocate audio buffers!");
+        while (1); // do nothing
+    }
+    
+    Serial.printf("Microphone configured - Buffer sizes: Recording=%u bytes, Compressed=%u bytes\n", 
+                 recording_buffer_size, compressed_buffer_size);
+}
+
+size_t read_microphone() {
+    size_t bytes_recorded = 0;
+    esp_i2s::i2s_read(esp_i2s::I2S_NUM_0, s_recording_buffer, recording_buffer_size, &bytes_recorded, portMAX_DELAY);
+    bytes_read += bytes_recorded;
+    return bytes_recorded;
+}
+
+void setup() {
+    Serial.begin(921600);
+    Serial.println("\n=== Starting BLE Audio Streaming ===");
+    
+    configure_ble();
+    configure_microphone();
+    Serial.println("Setup complete - Ready for connection");
+}
+
+void loop() {
+    if (!connected) {
+        delay(100);
+        return;
+    }
+
+    unsigned long current_time = millis();
+    
+    // Check if it's time to print stats
+    if (current_time - last_stats_time >= STATS_INTERVAL) {
+        printStats();
+    }
+
+    // Check frame timing
+    if (current_time - last_frame_time < FRAME_INTERVAL) {
+        frame_underruns++;
+        return;  // Not time for next frame yet
+    }
+
+    if (current_time - last_frame_time > FRAME_INTERVAL + 1) {
+        frame_overruns++;
+    }
+
+    // Read from mic
+    size_t bytes_recorded = read_microphone();
+
+    // Check if we got the expected number of bytes
+    if (bytes_recorded != recording_buffer_size) {
+        Serial.printf("Unexpected bytes recorded: %d\n", bytes_recorded);
+        return;
+    }
+
+    // Process and send audio data
+    // Add frame header first (before processing samples)
+    s_compressed_frame[0] = audio_frame_count & 0xFF;
+    s_compressed_frame[1] = (audio_frame_count >> 8) & 0xFF;
+    s_compressed_frame[2] = 0;
+
+    // Process all samples
+    for (size_t i = 0; i < FRAME_SIZE; i++) {
+        int16_t sample = ((int16_t *)s_recording_buffer)[i];
+        sample = sample << VOLUME_GAIN;
+        
+        // Store directly after header
+        s_compressed_frame[i * 2 + 3] = sample & 0xFF;           // Low byte
+        s_compressed_frame[i * 2 + 4] = (sample >> 8) & 0xFF;    // High byte
+    }
+
+    // Send the audio data
+    audioCharacteristic->setValue(s_compressed_frame, compressed_buffer_size);
+    audioCharacteristic->notify();
+    
+    audio_frame_count++;
+    frames_sent++;
+    bytes_sent += compressed_buffer_size;
+    last_frame_time = current_time;  // Update timing
+}
