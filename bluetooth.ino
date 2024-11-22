@@ -9,6 +9,18 @@
 #include "SD.h"
 #include "SPI.h"
 #include "mulaw.h"
+#include <WiFi.h>
+#include "time.h"
+#include "ESP32Time.h"
+
+//wifi for timestamp before BLE
+const char* ssid = "mango";
+const char* password = "peterpeel";
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = -28800;     // Replace with your GMT offset (e.g., -25200 for PDT, -28800 for PST)
+const int   daylightOffset_sec = 0;  // 3600 for daylight savings, 0 for standard time
+bool timeInitialized = false;
+ESP32Time rtc;
 
 // Device and Service UUIDs
 #define DEVICE_NAME "ESP32WAV"
@@ -78,11 +90,56 @@ void generate_wav_header(uint8_t *wav_header, uint32_t wav_size, uint32_t sample
     memcpy(wav_header, set_wav_header, sizeof(set_wav_header));
 }
 
+void setupTime() {
+    Serial.println("Connecting to WiFi for time sync...");
+    WiFi.begin(ssid, password);
+    
+    // Wait for connection with timeout
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {  // 10 second timeout
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nWiFi connection failed!");
+        return;
+    }
+    
+    Serial.println("\nWiFi connected");
+
+    // Init and get the time
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    
+    // Verify time was set
+    struct tm timeinfo;
+    if(!getLocalTime(&timeinfo)){
+        Serial.println("Failed to obtain time");
+    } else {
+        Serial.println("Time successfully obtained!");
+        char timeStr[64];
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+        Serial.printf("Current time: %s\n", timeStr);
+        timeInitialized = true;
+    }
+    
+    // Disconnect WiFi
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("WiFi disconnected");
+}
+
 void startRecording() {
     if (isRecording) return;
     
-    String filename = "/recording_" + String(millis()) + ".wav";
-    wavFile = SD.open(filename, FILE_WRITE);
+    // Create filename using RTC time
+    String timeStr = rtc.getTime("%Y-%m-%d_%H-%M-%S");
+    String filename = "/" + timeStr + ".wav";
+    
+    Serial.printf("Creating file: %s\n", filename.c_str());
+    
+    wavFile = SD.open(filename.c_str(), FILE_WRITE);
     if (!wavFile) {
         Serial.println("Failed to open file for writing");
         return;
@@ -94,7 +151,7 @@ void startRecording() {
     wavFile.write(header, WAV_HEADER_SIZE);
 
     isRecording = true;
-    Serial.println("Started recording to " + filename);
+    Serial.printf("Started recording to %s\n", filename.c_str());
 }
 
 void stopRecording() {
@@ -236,6 +293,10 @@ size_t read_microphone() {
 void setup() {
     Serial.begin(921600);
     Serial.println("\n=== Starting BLE Audio Streaming ===");
+    
+    // Set RTC time to compilation time
+    rtc.setTime(0, 0, 14, 22, 11, 2024);  // ss, mm, hh, dd, mm, yyyy
+    Serial.printf("RTC set to: %s\n", rtc.getTime("%Y-%m-%d_%H-%M-%S").c_str());
     
     if (!SD.begin(SD_CS_PIN)) {
         Serial.println("Failed to mount SD Card!");
