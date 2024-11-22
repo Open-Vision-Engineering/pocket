@@ -5,6 +5,9 @@
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
 #include "mulaw.h"
 
 // Device and Service UUIDs
@@ -19,6 +22,8 @@ static BLEUUID audioCharacteristicUUID("beb5483e-36e1-4688-b7f5-ea07361b26a8");
 #define FRAME_SIZE 160
 #define SAMPLE_RATE 16000
 #define SAMPLE_BITS 16
+#define WAV_HEADER_SIZE 44
+#define SD_CS_PIN 21
 
 // BLE characteristic and connection state
 BLECharacteristic *audioCharacteristic;
@@ -48,33 +53,65 @@ unsigned long bytes_sent = 0;
 unsigned long frame_overruns = 0;
 unsigned long frame_underruns = 0;
 
-// Forward declaration of printStats
-void printStats();
+// SD card recording
+File wavFile;
+bool isRecording = false;
 
-class ServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* server) {
-        connected = true;
-        audio_frame_count = 0;
-        last_frame_time = millis();
-        last_stats_time = millis();
-        frames_sent = 0;
-        last_frames_sent = 0;
-        bytes_read = 0;
-        bytes_sent = 0;
-        frame_overruns = 0;
-        frame_underruns = 0;
-        Serial.println("\n=== Client Connected ===");
-        Serial.println("Resetting all counters");
+void generate_wav_header(uint8_t *wav_header, uint32_t wav_size, uint32_t sample_rate) {
+    uint32_t file_size = wav_size + WAV_HEADER_SIZE - 8;
+    uint32_t byte_rate = sample_rate * SAMPLE_BITS / 8;
+    const uint8_t set_wav_header[] = {
+        'R', 'I', 'F', 'F',
+        file_size, file_size >> 8, file_size >> 16, file_size >> 24,
+        'W', 'A', 'V', 'E',
+        'f', 'm', 't', ' ',
+        0x10, 0x00, 0x00, 0x00,
+        0x01, 0x00,
+        0x01, 0x00,
+        sample_rate, sample_rate >> 8, sample_rate >> 16, sample_rate >> 24,
+        byte_rate, byte_rate >> 8, byte_rate >> 16, byte_rate >> 24,
+        0x02, 0x00,
+        0x10, 0x00,
+        'd', 'a', 't', 'a',
+        wav_size, wav_size >> 8, wav_size >> 16, wav_size >> 24,
+    };
+    memcpy(wav_header, set_wav_header, sizeof(set_wav_header));
+}
+
+void startRecording() {
+    if (isRecording) return;
+    
+    String filename = "/recording_" + String(millis()) + ".wav";
+    wavFile = SD.open(filename, FILE_WRITE);
+    if (!wavFile) {
+        Serial.println("Failed to open file for writing");
+        return;
     }
 
-    void onDisconnect(BLEServer* server) {
-        connected = false;
-        Serial.println("\n=== Client Disconnected ===");
-        Serial.println("Final Statistics:");
-        printStats();
-        BLEDevice::startAdvertising();
-    }
-};
+    // Write WAV header with placeholder size
+    uint8_t header[WAV_HEADER_SIZE];
+    generate_wav_header(header, 0, SAMPLE_RATE);
+    wavFile.write(header, WAV_HEADER_SIZE);
+
+    isRecording = true;
+    Serial.println("Started recording to " + filename);
+}
+
+void stopRecording() {
+    if (!isRecording) return;
+
+    uint32_t fileSize = wavFile.size() - WAV_HEADER_SIZE;
+    
+    // Update WAV header with final file size
+    wavFile.seek(0);
+    uint8_t header[WAV_HEADER_SIZE];
+    generate_wav_header(header, fileSize, SAMPLE_RATE);
+    wavFile.write(header, WAV_HEADER_SIZE);
+    
+    wavFile.close();
+    isRecording = false;
+    Serial.println("Recording stopped. File size: " + String(fileSize) + " bytes");
+}
 
 void printStats() {
     unsigned long current_time = millis();
@@ -98,7 +135,35 @@ void printStats() {
     last_stats_time = current_time;
 }
 
+class ServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* server) {
+        connected = true;
+        audio_frame_count = 0;
+        last_frame_time = millis();
+        last_stats_time = millis();
+        frames_sent = 0;
+        last_frames_sent = 0;
+        bytes_read = 0;
+        bytes_sent = 0;
+        frame_overruns = 0;
+        frame_underruns = 0;
+        Serial.println("\n=== Client Connected ===");
+        Serial.println("Resetting all counters");
+        startRecording();  // Start recording when client connects
+    }
+
+    void onDisconnect(BLEServer* server) {
+        connected = false;
+        Serial.println("\n=== Client Disconnected ===");
+        Serial.println("Final Statistics:");
+        printStats();
+        stopRecording();  // Stop recording when client disconnects
+        BLEDevice::startAdvertising();
+    }
+};
+
 void configure_ble() {
+    // Initialize BLE with the correct name
     BLEDevice::init(DEVICE_NAME);
     BLEServer *server = BLEDevice::createServer();
     server->setCallbacks(new ServerCallbacks());
@@ -119,15 +184,21 @@ void configure_ble() {
     // Start the service
     service->start();
 
-    // Start advertising
+    // Modified advertising configuration
     BLEAdvertising *advertising = BLEDevice::getAdvertising();
     advertising->addServiceUUID(serviceUUID);
     advertising->setScanResponse(true);
     advertising->setMinPreferred(0x06);
     advertising->setMaxPreferred(0x12);
     
+    // Add these lines to ensure the name is set correctly
+    BLEAdvertisementData scanResponse;
+    scanResponse.setName(DEVICE_NAME);
+    advertising->setScanResponseData(scanResponse);
+    
     BLEDevice::startAdvertising();
     Serial.println("BLE service started");
+    Serial.printf("Device Name: %s\n", DEVICE_NAME);
     Serial.printf("Audio configuration: %dHz, %d-bit, Frame size: %d samples\n", 
                  SAMPLE_RATE, SAMPLE_BITS, FRAME_SIZE);
 }
@@ -166,6 +237,12 @@ void setup() {
     Serial.begin(921600);
     Serial.println("\n=== Starting BLE Audio Streaming ===");
     
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("Failed to mount SD Card!");
+        while (1);
+    }
+    Serial.println("SD Card mounted successfully");
+    
     configure_ble();
     configure_microphone();
     Serial.println("Setup complete - Ready for connection");
@@ -201,6 +278,11 @@ void loop() {
     if (bytes_recorded != recording_buffer_size) {
         Serial.printf("Unexpected bytes recorded: %d\n", bytes_recorded);
         return;
+    }
+
+    // Write raw audio to SD card before any processing
+    if (isRecording) {
+        wavFile.write(s_recording_buffer, recording_buffer_size);
     }
 
     // Process and send audio data
