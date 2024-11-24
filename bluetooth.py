@@ -4,6 +4,7 @@ import struct
 import wave
 import time
 import os
+from datetime import datetime
 
 # BLE UUIDs (must match ESP32)
 SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -18,13 +19,18 @@ SAMPLE_WIDTH = 2  # 16-bit audio
 CHANNELS = 1
 
 class AudioStreamReceiver:
-    def __init__(self, output_filename="received_audio.wav"):
-        self.output_filename = output_filename
+    def __init__(self):
+        self.reset_session()
+        
+    def reset_session(self):
+        """Reset all session variables for a new recording"""
         self.audio_data = bytearray()
         self.start_time = None
         self.last_progress_time = None
         self.frames_received = 0
         self.last_frame_count = None
+        self.last_data_time = None
+        self.is_receiving = False
         self.samples_per_frame = 160  # Match ESP32's FRAME_SIZE
         self.frame_stats = {
             'drops': 0,
@@ -34,9 +40,21 @@ class AudioStreamReceiver:
         
     def notification_handler(self, sender, data):
         """Handle incoming BLE notifications"""
+        current_time = time.time()
+        
+        # If we're getting data after a pause, this is a new session
+        if self.last_data_time and (current_time - self.last_data_time) > 1.0:
+            if self.is_receiving:
+                # Previous session ended, save it
+                self.save_wav_file()
+                self.reset_session()
+        
+        self.last_data_time = current_time
+        self.is_receiving = True
+        
         if not self.start_time:
-            self.start_time = time.time()
-            self.last_progress_time = time.time()
+            self.start_time = current_time
+            self.last_progress_time = current_time
             
         if len(data) < 3:  # Ensure we have at least the header
             print(f"Warning: Received incomplete frame (length: {len(data)})")
@@ -69,7 +87,6 @@ class AudioStreamReceiver:
         self.frames_received += 1
         
         # Print progress every second
-        current_time = time.time()
         if self.last_progress_time and (current_time - self.last_progress_time) >= 1.0:
             kb_received = len(self.audio_data) / 1024
             duration = len(self.audio_data) / (SAMPLE_RATE * SAMPLE_WIDTH)
@@ -83,13 +100,30 @@ class AudioStreamReceiver:
             print(f"Invalid sized frames: {self.frame_stats['invalid_size']}")
             self.last_progress_time = current_time
 
+    async def check_stream_status(self):
+        """Periodically check if we've stopped receiving data"""
+        while True:
+            await asyncio.sleep(1)
+            current_time = time.time()
+            
+            if (self.is_receiving and self.last_data_time and 
+                (current_time - self.last_data_time) > 1.0):
+                # We've stopped receiving data, save the file
+                print("\nStream stopped, saving recording...")
+                self.save_wav_file()
+                self.reset_session()
+
     def save_wav_file(self):
         """Save the collected audio data as a WAV file"""
         if not self.audio_data:
             print("No audio data collected!")
             return
             
-        with wave.open(self.output_filename, 'wb') as wav_file:
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"recording_{timestamp}.wav"
+            
+        with wave.open(filename, 'wb') as wav_file:
             wav_file.setnchannels(CHANNELS)
             wav_file.setsampwidth(SAMPLE_WIDTH)
             wav_file.setframerate(SAMPLE_RATE)
@@ -99,7 +133,7 @@ class AudioStreamReceiver:
         expected_frames = duration * SAMPLE_RATE / self.samples_per_frame
         
         print("\n=== Recording Summary ===")
-        print(f"Audio saved to: {self.output_filename}")
+        print(f"Audio saved to: {filename}")
         print(f"Total frames received: {self.frames_received}")
         print(f"Expected frames: {expected_frames:.0f}")
         print(f"Recording duration: {duration:.1f} seconds")
@@ -118,6 +152,8 @@ class AudioStreamReceiver:
         if abs(1 - data_ratio) > 0.1:  # More than 10% off
             print("Warning: Significant difference between expected and actual data rate")
             print("This might explain any speed issues in the recording")
+        
+        print("\nReady for next recording session...")
 
 async def find_device():
     """Scan for esp32 device"""
@@ -165,18 +201,23 @@ async def main():
                 receiver.notification_handler
             )
             
-            # Keep connection alive until user interrupts
-            print("\nRecording... Press Ctrl+C to stop")
-            while True:
-                await asyncio.sleep(1)
+            # Start the stream status checker
+            status_checker = asyncio.create_task(receiver.check_stream_status())
+            
+            print("\nReady for recording... Use serial monitor to start/stop")
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                status_checker.cancel()
                 
     except KeyboardInterrupt:
-        print("\nRecording stopped by user")
+        print("\nConnection terminated by user")
     except Exception as e:
         print(f"\nError: {e}")
         print("If you're seeing a timeout error, try running the script again.")
     finally:
-        # Save received audio data
+        # Save any remaining audio data
         if receiver.audio_data:
             receiver.save_wav_file()
 
