@@ -35,6 +35,8 @@ const char* ap_password = "12345678";
 bool wifi_active = false;
 WebServer server(80);
 String currentWavFile = "";
+#define TRANSFER_BUFFER_SIZE 4096
+#define MAX_CLIENTS 4
 
 // Device and Service UUIDs
 #define DEVICE_NAME "ESP32WAV"
@@ -86,15 +88,18 @@ bool isRecording = false;
 void setupWiFiDirect() {
     Serial.println("\nInitializing WiFi Direct...");
     
-    // Disconnect from any existing WiFi
+    // Disconnect and reset WiFi
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     delay(100);
     
-    // Configure device as an Access Point
+    // Configure AP with improved settings
     WiFi.mode(WIFI_AP);
     
-    // Configure AP settings
+    // Improve AP performance
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Max power for better connection
+    
+    // Configure network with static IP
     if (!WiFi.softAPConfig(IPAddress(192,168,4,1), 
                           IPAddress(192,168,4,1), 
                           IPAddress(255,255,255,0))) {
@@ -102,28 +107,22 @@ void setupWiFiDirect() {
         return;
     }
     
-    // Start the AP
-    if(WiFi.softAP(ap_ssid, ap_password)) {
+    // Start AP with increased max connections
+    if(WiFi.softAP(ap_ssid, ap_password, 1, 0, MAX_CLIENTS)) {
         Serial.println("WiFi Direct AP started successfully");
         Serial.printf("SSID: %s\n", ap_ssid);
         Serial.printf("Password: %s\n", ap_password);
         Serial.printf("AP IP address: %s\n", WiFi.softAPIP().toString().c_str());
         wifi_active = true;
-        Serial.flush();  // Make sure all Serial data is sent
-        // Print current WiFi status
-        Serial.printf("AP Status: %s\n", WiFi.softAPIP().toString().c_str());
-        Serial.printf("Current Connections: %d\n", WiFi.softAPgetStationNum());
     } else {
         Serial.println("WiFi Direct AP failed to start");
         wifi_active = false;
         return;
     }
     
-    // Set up server routes
+    // Set up server
     server.on("/", HTTP_GET, handleRoot);
     server.on("/file", HTTP_GET, handleFileDownload);
-    
-    // Start server
     server.begin();
     Serial.println("HTTP server started successfully");
 }
@@ -143,121 +142,86 @@ void handleRoot() {
     server.send(200, "text/html", html);
 }
 
+// Improved file download handler with better buffering and error handling
 void handleFileDownload() {
     Serial.println("\nClient requested file download");
     
-    // Add debug logging
-    Serial.printf("Current WAV file: '%s'\n", currentWavFile.c_str());
-    
     if(currentWavFile.length() == 0) {
-        Serial.println("Error: No file path available");
         server.send(404, "text/plain", "No file available");
         return;
     }
     
-    // List files in root directory for debugging
-    Serial.println("\nAvailable files on SD card:");
-    File root = SD.open("/");
-    if(!root) {
-        Serial.println("Failed to open root directory");
-        server.send(500, "text/plain", "Failed to access SD card");
-        return;
-    }
-    
-    // First pass: just list files
-    while (File file = root.openNextFile()) {
-        Serial.printf("- %s (size: %u bytes)\n", file.name(), file.size());
-        file.close();
-    }
-    root.close();
-    
-    // Try different path variations
-    const char* pathsToTry[] = {
-        currentWavFile.c_str(),           // Original path
-        ("/" + currentWavFile).c_str(),   // With leading slash
-        currentWavFile.substring(1).c_str() // Without leading slash if it exists
-    };
-    
-    File file;
-    const char* successPath = nullptr;
-    
-    for(const char* path : pathsToTry) {
-        Serial.printf("\nTrying to open: '%s'\n", path);
-        file = SD.open(path, FILE_READ);
-        if(file) {
-            successPath = path;
-            Serial.printf("Successfully opened file with path: %s\n", path);
-            break;
-        } else {
-            Serial.printf("Failed to open file with path: %s\n", path);
-        }
-    }
-    
+    File file = SD.open(currentWavFile.c_str(), FILE_READ);
     if(!file) {
-        Serial.println("All file open attempts failed");
         server.send(404, "text/plain", "File not found");
         return;
     }
     
     size_t fileSize = file.size();
-    Serial.printf("File opened successfully. Size: %u bytes\n", fileSize);
     
-    // Set appropriate headers
-    server.sendHeader("Content-Type", "audio/wav");
-    server.sendHeader("Content-Disposition", "attachment; filename=" + String(file.name()));
-    server.sendHeader("Connection", "close");
-    server.sendHeader("Content-Length", String(fileSize));
+    WiFiClient client = server.client();
+    client.setNoDelay(true);  // Disable Nagle's algorithm
     
-    // Send the file in chunks
-    const size_t bufferSize = 2048;
-    uint8_t *buffer = (uint8_t*)malloc(bufferSize);
+    // Send headers with keep-alive
+    String headers = "HTTP/1.1 200 OK\r\n";
+    headers += "Content-Type: audio/wav\r\n";
+    headers += "Content-Length: " + String(fileSize) + "\r\n";
+    headers += "Connection: keep-alive\r\n";
+    headers += "Keep-Alive: timeout=15, max=100\r\n";
+    headers += "Accept-Ranges: bytes\r\n";
+    headers += "\r\n";
+    
+    client.print(headers);
+    
+    uint8_t *buffer = (uint8_t*)ps_malloc(TRANSFER_BUFFER_SIZE);
     if (!buffer) {
-        Serial.println("Failed to allocate buffer");
         file.close();
-        server.send(500, "text/plain", "Server error");
         return;
     }
     
-    size_t bytesRemaining = fileSize;
     size_t bytesSent = 0;
+    unsigned long startTime = millis();
+    unsigned long lastProgressTime = startTime;
     
-    WiFiClient client = server.client();
-    Serial.println("Starting file transfer...");
-    
-    while(bytesRemaining > 0 && client.connected()) {
-        size_t chunkSize = min(bytesRemaining, bufferSize);
-        size_t bytesRead = file.read(buffer, chunkSize);
+    while(file.available() && client.connected()) {
+        size_t bytesRead = file.read(buffer, TRANSFER_BUFFER_SIZE);
+        if(bytesRead == 0) break;
         
-        if(bytesRead == 0) {
-            Serial.println("Error: Failed to read from file");
-            break;
+        // Send in smaller chunks with yield() between
+        size_t bytesRemaining = bytesRead;
+        uint8_t* bufPtr = buffer;
+        
+        while(bytesRemaining > 0 && client.connected()) {
+            size_t chunkSize = (bytesRemaining < 1024U) ? bytesRemaining : 1024U;
+            size_t bytesWritten = client.write(bufPtr, chunkSize);
+            
+            if(bytesWritten == 0) {
+                Serial.println("Write failed");
+                break;
+            }
+            
+            bytesSent += bytesWritten;
+            bytesRemaining -= bytesWritten;
+            bufPtr += bytesWritten;
+            
+            yield();  // Allow other processes to run
         }
         
-        size_t sent = client.write(buffer, bytesRead);
-        if(sent == 0) {
-            Serial.println("Error: Client connection lost");
-            break;
-        }
-        
-        bytesRemaining -= sent;
-        bytesSent += sent;
-        
-        if (bytesSent % (bufferSize * 16) == 0) {
-            Serial.printf("Transfer progress: %u/%u bytes (%.1f%%)\n", 
-                        bytesSent, fileSize, (bytesSent * 100.0) / fileSize);
+        // Progress update
+        unsigned long currentTime = millis();
+        if(currentTime - lastProgressTime >= 1000) {
+            float percentage = (bytesSent * 100.0) / fileSize;
+            float speed = bytesSent / ((currentTime - startTime) / 1000.0);
+            Serial.printf("Progress: %.1f%% Speed: %.1f KB/s\n", 
+                        percentage, speed/1024.0);
+            lastProgressTime = currentTime;
         }
     }
     
     free(buffer);
     file.close();
     
-    if(bytesSent == fileSize) {
-        Serial.println("File transfer completed successfully");
-        Serial.printf("Total bytes sent: %u\n", bytesSent);
-    } else {
-        Serial.println("Warning: File transfer incomplete");
-        Serial.printf("Sent %u/%u bytes\n", bytesSent, fileSize);
-    }
+    Serial.printf("Transfer complete: %u bytes\n", bytesSent);
 }
 
 void generate_wav_header(uint8_t *wav_header, uint32_t wav_size, uint32_t sample_rate) {
@@ -603,7 +567,23 @@ void setup() {
 }
 
 void loop() {
-    // Process any available serial commands
+    static uint8_t lastStationNum = 0;
+    static unsigned long lastServerCheck = 0;
+    unsigned long current_time = millis();
+    
+    // Check if we're actively transferring a file
+    bool isTransferringFile = server.client() && server.client().connected();
+    
+    if (isTransferringFile) {
+        // During file transfer, only handle client requests and yield
+        server.handleClient();
+        delay(1);  // Minimal delay to prevent WiFi stack issues
+        return;    // Skip all other processing during file transfer
+    }
+    
+    // Normal operation when not transferring files
+    
+    // Process serial commands with non-blocking approach
     while (Serial.available()) {
         char inChar = (char)Serial.read();
         if (inChar == '\n') {
@@ -614,55 +594,57 @@ void loop() {
         }
     }
 
-    // Monitor WiFi connections
-    static uint8_t lastStationNum = 0;
-    uint8_t currentStationNum = WiFi.softAPgetStationNum();
-    if (currentStationNum != lastStationNum) {
-        Serial.printf("WiFi client connection changed. Connected clients: %d\n", currentStationNum);
-        if (currentStationNum > lastStationNum) {
-            // A new client connected
-            Serial.printf("New client connected. IP: %s\n", WiFi.softAPIP().toString().c_str());
+    // Monitor WiFi connections (only check every 100ms)
+    static unsigned long lastWifiCheck = 0;
+    if (current_time - lastWifiCheck >= 100) {
+        uint8_t currentStationNum = WiFi.softAPgetStationNum();
+        if (currentStationNum != lastStationNum) {
+            Serial.printf("WiFi client connection changed. Connected clients: %d\n", currentStationNum);
+            if (currentStationNum > lastStationNum) {
+                Serial.printf("New client connected. IP: %s\n", WiFi.softAPIP().toString().c_str());
+            }
+            lastStationNum = currentStationNum;
         }
-        lastStationNum = currentStationNum;
+        lastWifiCheck = current_time;
     }
 
     // Handle client requests
     server.handleClient();
     
     // Monitor server status every 5 seconds
-    static unsigned long lastServerCheck = 0;
-    if (millis() - lastServerCheck >= 5000) {
+    if (current_time - lastServerCheck >= 5000) {
         Serial.printf("Server status - WiFi active: %d, Connected clients: %d\n", 
                      wifi_active, WiFi.softAPgetStationNum());
-        lastServerCheck = millis();
+        lastServerCheck = current_time;
     }
 
+    // If not connected or not streaming, wait with reduced delay
     if (!connected || !isStreaming) {
-        delay(100);
+        delay(50);  // Reduced from 100ms to improve responsiveness
         return;
     }
 
-    unsigned long current_time = millis();
+    // Audio streaming section
     
     // Check if it's time to print stats
     if (current_time - last_stats_time >= STATS_INTERVAL) {
         printStats();
     }
 
-    // Check frame timing
-    if (current_time - last_frame_time < FRAME_INTERVAL) {
+    // Check frame timing with improved accuracy
+    long frame_delay = current_time - last_frame_time;
+    if (frame_delay < FRAME_INTERVAL) {
         frame_underruns++;
-        return;  // Not time for next frame yet
+        delayMicroseconds((FRAME_INTERVAL - frame_delay) * 1000);  // More precise delay
+        return;
     }
 
-    if (current_time - last_frame_time > FRAME_INTERVAL + 1) {
+    if (frame_delay > FRAME_INTERVAL + 1) {
         frame_overruns++;
     }
 
     // Read from mic
     size_t bytes_recorded = read_microphone();
-
-    // Check if we got the expected number of bytes
     if (bytes_recorded != recording_buffer_size) {
         Serial.printf("Unexpected bytes recorded: %d\n", bytes_recorded);
         return;
@@ -670,23 +652,25 @@ void loop() {
 
     // Write raw audio to SD card if recording is active
     if (isRecording) {
-        wavFile.write(s_recording_buffer, recording_buffer_size);
+        if (wavFile.write(s_recording_buffer, recording_buffer_size) != recording_buffer_size) {
+            Serial.println("Failed to write to SD card");
+            // Consider stopping recording if write fails
+        }
     }
 
     // Process and send audio data
-    // Add frame header first (before processing samples)
+    // Add frame header
     s_compressed_frame[0] = audio_frame_count & 0xFF;
     s_compressed_frame[1] = (audio_frame_count >> 8) & 0xFF;
     s_compressed_frame[2] = 0;
 
-    // Process all samples
+    // Process all samples with improved efficiency
+    int16_t* samples = (int16_t*)s_recording_buffer;
+    uint8_t* output = s_compressed_frame + 3;
     for (size_t i = 0; i < FRAME_SIZE; i++) {
-        int16_t sample = ((int16_t *)s_recording_buffer)[i];
-        sample = sample << VOLUME_GAIN;
-        
-        // Store directly after header
-        s_compressed_frame[i * 2 + 3] = sample & 0xFF;           // Low byte
-        s_compressed_frame[i * 2 + 4] = (sample >> 8) & 0xFF;    // High byte
+        int16_t sample = samples[i] << VOLUME_GAIN;
+        *output++ = sample & 0xFF;         // Low byte
+        *output++ = (sample >> 8) & 0xFF;  // High byte
     }
 
     // Send the audio data
@@ -696,5 +680,5 @@ void loop() {
     audio_frame_count++;
     frames_sent++;
     bytes_sent += compressed_buffer_size;
-    last_frame_time = current_time;  // Update timing
+    last_frame_time = current_time;
 }
