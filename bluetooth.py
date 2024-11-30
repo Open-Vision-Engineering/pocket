@@ -238,21 +238,20 @@ class AudioStreamReceiver:
                 print(f"Failed to restore original WiFi: {e}")
         
     async def download_wav_file(self):
-        """Download the WAV file from ESP32 over WiFi with improved reliability"""
-        print("\nInitiating WiFi Direct transfer...")
+        """Download the WAV file from ESP32 over WiFi with maximum speed optimizations"""
+        print("\nInitiating high-speed WiFi Direct transfer...")
         
+        CHUNK_SIZE = 32768  # 32KB to match server's chunk size
         MAX_RETRIES = 3
-        RETRY_DELAY = 5
-        CHUNK_SIZE = 8192  # Increased chunk size
+        STABILITY_WAIT = 2  # Seconds to wait for connection stability
         
         async def verify_connection():
             """Verify connection stability"""
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get('http://192.168.4.1', 
-                                        timeout=aiohttp.ClientTimeout(total=10)) as response:
-                        await response.text()
-                        return True
+                                        timeout=aiohttp.ClientTimeout(total=5)) as response:
+                        return response.status == 200
             except:
                 return False
         
@@ -263,88 +262,110 @@ class AudioStreamReceiver:
                 if not await self.connect_to_esp32_wifi():
                     print(f"Failed to establish WiFi connection on attempt {attempt + 1}")
                     if attempt < MAX_RETRIES - 1:
-                        await asyncio.sleep(RETRY_DELAY)
+                        await asyncio.sleep(2)
                     continue
                 
-                # Wait for connection to stabilize
-                stable_connection = False
-                for _ in range(3):
-                    if await verify_connection():
-                        stable_connection = True
-                        break
-                    await asyncio.sleep(2)
-                
-                if not stable_connection:
+                # Wait for connection stability
+                print("Waiting for connection stability...")
+                await asyncio.sleep(STABILITY_WAIT)
+                if not await verify_connection():
                     print("Connection not stable, retrying...")
                     continue
-
+                
+                # Configure optimized aiohttp session
                 timeout = aiohttp.ClientTimeout(
-                    total=600,     # 10 minutes total timeout
-                    connect=30,    # 30 seconds connect timeout
-                    sock_read=30,  # 30 seconds read timeout
-                    sock_connect=30  # 30 seconds socket connect timeout
+                    total=300,      # 5 minutes total timeout
+                    connect=10,     # 10 seconds connect timeout
+                    sock_read=10,   # 10 seconds read timeout
+                    sock_connect=10 # 10 seconds socket connect timeout
                 )
                 
+                # TCP optimizations
                 connector = aiohttp.TCPConnector(
                     force_close=True,
                     enable_cleanup_closed=True,
-                    limit=1  # Single connection
+                    limit=1,  # Single connection for maximum throughput
+                    ttl_dns_cache=300,  # Cache DNS for 5 minutes
+                    use_dns_cache=True
                 )
                 
                 async with aiohttp.ClientSession(timeout=timeout, 
-                                            connector=connector) as session:
+                                            connector=connector,
+                                            raise_for_status=True) as session:
+                    
+                    # Test connection before starting download
+                    async with session.get('http://192.168.4.1') as response:
+                        if response.status != 200:
+                            raise aiohttp.ClientError(f"Server returned {response.status}")
+                    
+                    print("Starting file download...")
                     async with session.get('http://192.168.4.1/file',
                                         timeout=timeout) as response:
                         
-                        if response.status != 200:
-                            print(f"Error response: {response.status}")
-                            text = await response.text()
-                            print(f"Error content: {text}")
-                            continue
+                        total_size = int(response.headers.get('Content-Length', 0))
+                        if total_size == 0:
+                            raise ValueError("Content-Length header missing")
                         
                         filename = f"sdcard_recording_{self.current_file_timestamp}.wav"
-                        total_size = int(response.headers.get('Content-Length', 0))
-                        
-                        if total_size == 0:
-                            print("Warning: Content-Length is 0")
-                            continue
-                        
-                        print(f"\nStarting download of {total_size/1024:.1f} KB to {filename}")
+                        print(f"\nDownloading {total_size/1024/1024:.1f} MB to {filename}")
                         
                         with open(filename, 'wb') as f:
                             received_size = 0
                             start_time = time.time()
                             last_progress_time = start_time
+                            last_speed_update = start_time
+                            speed_samples = []  # For calculating average speed
                             
                             async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                                if chunk:
+                                if chunk:  # Filter out empty chunks
                                     f.write(chunk)
                                     received_size += len(chunk)
                                     
                                     current_time = time.time()
-                                    if current_time - last_progress_time >= 1.0:
-                                        speed = received_size / (current_time - start_time) / 1024  # KB/s
-                                        progress = (received_size / total_size) * 100
-                                        print(f"Progress: {progress:.1f}% Speed: {speed:.1f} KB/s", 
-                                            end='\r')
-                                        last_progress_time = current_time
+                                    elapsed = current_time - start_time
+                                    
+                                    # Update progress and speed every 0.5 seconds
+                                    if current_time - last_speed_update >= 0.5:
+                                        speed = received_size / elapsed / 1024 / 1024  # MB/s
+                                        speed_samples.append(speed)
+                                        if len(speed_samples) > 5:  # Keep last 5 samples
+                                            speed_samples.pop(0)
+                                        avg_speed = sum(speed_samples) / len(speed_samples)
                                         
-                                        if speed < 10:  # Less than 10 KB/s
-                                            print("\nTransfer too slow, restarting...")
-                                            raise aiohttp.ClientError("Transfer too slow")
-                        
-                        if received_size == total_size:
-                            print(f"\nDownload completed successfully: {filename}")
-                            return True
-                        else:
-                            print(f"\nSize mismatch: {received_size}/{total_size}")
-                            if os.path.exists(filename):
-                                os.remove(filename)
+                                        progress = (received_size / total_size) * 100
+                                        mbps = avg_speed * 8  # Convert MB/s to Mbps
+                                        
+                                        # Calculate ETA
+                                        remaining_bytes = total_size - received_size
+                                        eta_seconds = remaining_bytes / (received_size / elapsed)
+                                        
+                                        print(f"Progress: {progress:.1f}% "
+                                            f"Speed: {mbps:.1f} Mbps "
+                                            f"ETA: {eta_seconds:.1f}s", end='\r')
+                                        
+                                        last_speed_update = current_time
+                            
+                            # Final statistics
+                            total_time = time.time() - start_time
+                            avg_speed_mbps = (received_size / total_time / 1024 / 1024) * 8
+                            
+                            print(f"\n\nTransfer Complete:")
+                            print(f"Total size: {received_size/1024/1024:.2f} MB")
+                            print(f"Time: {total_time:.2f} seconds")
+                            print(f"Average speed: {avg_speed_mbps:.2f} Mbps")
+                            
+                            if received_size == total_size:
+                                print(f"\nFile saved successfully: {filename}")
+                                return True
+                            else:
+                                print(f"\nSize mismatch: {received_size}/{total_size}")
+                                if os.path.exists(filename):
+                                    os.remove(filename)
                                 
+            except aiohttp.ClientError as e:
+                print(f"Network error during attempt {attempt + 1}: {e}")
             except Exception as e:
                 print(f"Error during attempt {attempt + 1}: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY)
             finally:
                 if attempt == MAX_RETRIES - 1:
                     await self.restore_wifi()
@@ -540,5 +561,3 @@ async def main():
 if __name__ == "__main__":
     # For macOS, you might need to run with sudo
     asyncio.run(main())
-
-
