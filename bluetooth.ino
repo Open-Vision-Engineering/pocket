@@ -14,6 +14,7 @@
 #include "ESP32Time.h"
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <esp_wifi.h>
 
 //wifi for timestamp before BLE
 const char* ssid = "mango";
@@ -35,8 +36,9 @@ const char* ap_password = "12345678";
 bool wifi_active = false;
 WebServer server(80);
 String currentWavFile = "";
-#define TRANSFER_BUFFER_SIZE 4096
-#define MAX_CLIENTS 4
+#define TRANSFER_BUFFER_SIZE 65536  // 64KB - Maximum practical buffer size
+#define CHUNK_SIZE 32768       // 32KB chunks for maximum throughput
+#define MAX_CLIENTS 1          // Limit to 1 client for maximum bandwidth
 
 // Device and Service UUIDs
 #define DEVICE_NAME "ESP32WAV"
@@ -88,44 +90,85 @@ bool isRecording = false;
 void setupWiFiDirect() {
     Serial.println("\nInitializing WiFi Direct...");
     
-    // Disconnect and reset WiFi
+    // Complete WiFi disconnect and cleanup
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     delay(100);
     
-    // Configure AP with improved settings
+    // Configure AP with optimized settings
     WiFi.mode(WIFI_AP);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     
-    // Improve AP performance
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Max power for better connection
+    // Configure for static IP - do this before starting AP
+    IPAddress local_IP(192,168,4,1);
+    IPAddress gateway(192,168,4,1);
+    IPAddress subnet(255,255,255,0);
     
-    // Configure network with static IP
-    if (!WiFi.softAPConfig(IPAddress(192,168,4,1), 
-                          IPAddress(192,168,4,1), 
-                          IPAddress(255,255,255,0))) {
-        Serial.println("AP Config failed");
+    Serial.println("Configuring soft-AP...");
+    if (!WiFi.softAPConfig(local_IP, gateway, subnet)) {
+        Serial.println("Soft-AP configuration failed");
         return;
     }
     
-    // Start AP with increased max connections
-    if(WiFi.softAP(ap_ssid, ap_password, 1, 0, MAX_CLIENTS)) {
-        Serial.println("WiFi Direct AP started successfully");
-        Serial.printf("SSID: %s\n", ap_ssid);
-        Serial.printf("Password: %s\n", ap_password);
-        Serial.printf("AP IP address: %s\n", WiFi.softAPIP().toString().c_str());
-        wifi_active = true;
-    } else {
-        Serial.println("WiFi Direct AP failed to start");
-        wifi_active = false;
+    // Start AP
+    Serial.println("Starting soft-AP...");
+    if(!WiFi.softAP(ap_ssid, ap_password, 1, 0, 1)) {
+        Serial.println("Soft-AP start failed");
         return;
     }
     
-    // Set up server
-    server.on("/", HTTP_GET, handleRoot);
+    delay(500); // Give AP more time to start up
+    
+    Serial.println("Configuring HTTP server...");
+    // Define server routes BEFORE begin()
+    server.on("/", HTTP_GET, []() {
+        Serial.println("Root page accessed");
+        server.send(200, "text/html", "<h1>ESP32 Audio Server</h1>");
+    });
+    
+    server.on("/test", HTTP_GET, []() {
+        Serial.println("Test endpoint accessed");
+        server.send(200, "text/plain", "Server is running");
+    });
+    
     server.on("/file", HTTP_GET, handleFileDownload);
+    
+    // Start server
+    Serial.println("Starting HTTP server...");
     server.begin();
-    Serial.println("HTTP server started successfully");
+    
+    // Verify server status
+    Serial.printf("Server running: %s\n", server.client() ? "Yes" : "No");
+    Serial.printf("Soft-AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+    
+    wifi_active = true;
 }
+
+// Call this in your loop
+void checkServerStatus() {
+    static unsigned long lastCheck = 0;
+    unsigned long currentTime = millis();
+    
+    if (currentTime - lastCheck >= 5000) {  // Check every 5 seconds
+        lastCheck = currentTime;
+        Serial.printf("Server Status:\n");
+        Serial.printf("- WiFi Mode: %d\n", WiFi.getMode());
+        Serial.printf("- AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+        Serial.printf("- Connected clients: %d\n", WiFi.softAPgetStationNum());
+        Serial.printf("- wifi_active flag: %d\n", wifi_active);
+        
+        // Try to create a test client connection
+        WiFiClient testClient;
+        if (testClient.connect(WiFi.softAPIP(), 80)) {
+            Serial.println("- Local server test: SUCCESS");
+            testClient.stop();
+        } else {
+            Serial.println("- Local server test: FAILED");
+        }
+    }
+}
+
+
 
 // Handle root page
 void handleRoot() {
@@ -144,7 +187,7 @@ void handleRoot() {
 
 // Improved file download handler with better buffering and error handling
 void handleFileDownload() {
-    Serial.println("\nClient requested file download");
+    Serial.println("\nInitiating high-speed file transfer...");
     
     if(currentWavFile.length() == 0) {
         server.send(404, "text/plain", "No file available");
@@ -160,39 +203,48 @@ void handleFileDownload() {
     size_t fileSize = file.size();
     
     WiFiClient client = server.client();
-    client.setNoDelay(true);  // Disable Nagle's algorithm
+    client.setNoDelay(true);     // Disable Nagle's algorithm
     
-    // Send headers with keep-alive
-    String headers = "HTTP/1.1 200 OK\r\n";
-    headers += "Content-Type: audio/wav\r\n";
-    headers += "Content-Length: " + String(fileSize) + "\r\n";
-    headers += "Connection: keep-alive\r\n";
-    headers += "Keep-Alive: timeout=15, max=100\r\n";
-    headers += "Accept-Ranges: bytes\r\n";
-    headers += "\r\n";
+    // TCP optimization
+    int tcp_mss = 1460;
+    
+    // Minimal headers for reduced overhead
+    String headers = "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: audio/wav\r\n"
+                    "Content-Length: " + String(fileSize) + "\r\n"
+                    "Connection: keep-alive\r\n\r\n";
     
     client.print(headers);
     
-    uint8_t *buffer = (uint8_t*)ps_malloc(TRANSFER_BUFFER_SIZE);
+    // Allocate maximum buffer in PSRAM if available
+    uint8_t *buffer = NULL;
+    if(psramFound()) {
+        buffer = (uint8_t*)ps_malloc(TRANSFER_BUFFER_SIZE);
+    }
     if (!buffer) {
-        file.close();
-        return;
+        buffer = (uint8_t*)malloc(CHUNK_SIZE);  // Fallback to smaller size
+        if (!buffer) {
+            file.close();
+            return;
+        }
     }
     
     size_t bytesSent = 0;
     unsigned long startTime = millis();
     unsigned long lastProgressTime = startTime;
     
+    // Pre-calculate TCP segment size for optimal network packets
+    size_t optimalChunkSize = (CHUNK_SIZE / tcp_mss) * tcp_mss;
+    
     while(file.available() && client.connected()) {
         size_t bytesRead = file.read(buffer, TRANSFER_BUFFER_SIZE);
         if(bytesRead == 0) break;
         
-        // Send in smaller chunks with yield() between
         size_t bytesRemaining = bytesRead;
         uint8_t* bufPtr = buffer;
         
         while(bytesRemaining > 0 && client.connected()) {
-            size_t chunkSize = (bytesRemaining < 1024U) ? bytesRemaining : 1024U;
+            size_t chunkSize = (bytesRemaining < optimalChunkSize) ? bytesRemaining : optimalChunkSize;
             size_t bytesWritten = client.write(bufPtr, chunkSize);
             
             if(bytesWritten == 0) {
@@ -203,25 +255,35 @@ void handleFileDownload() {
             bytesSent += bytesWritten;
             bytesRemaining -= bytesWritten;
             bufPtr += bytesWritten;
-            
-            yield();  // Allow other processes to run
         }
         
-        // Progress update
+        // Progress monitoring with speed calculation
         unsigned long currentTime = millis();
-        if(currentTime - lastProgressTime >= 1000) {
-            float percentage = (bytesSent * 100.0) / fileSize;
-            float speed = bytesSent / ((currentTime - startTime) / 1000.0);
-            Serial.printf("Progress: %.1f%% Speed: %.1f KB/s\n", 
-                        percentage, speed/1024.0);
+        if(currentTime - lastProgressTime >= 1000) {  // Update every second
+            float elapsedSecs = (currentTime - startTime) / 1000.0;
+            float speedMbps = (bytesSent * 8.0) / (elapsedSecs * 1000000.0);  // Convert to Mbps
+            float progress = (bytesSent * 100.0) / fileSize;
+            
+            Serial.printf("Progress: %.1f%% Speed: %.2f Mbps\n", progress, speedMbps);
             lastProgressTime = currentTime;
+            
+            // Calculate estimated completion time
+            float remainingBytes = fileSize - bytesSent;
+            float estimatedSeconds = remainingBytes / (bytesSent / elapsedSecs);
+            Serial.printf("Estimated completion in: %.1f seconds\n", estimatedSeconds);
         }
     }
     
+    client.flush();
     free(buffer);
     file.close();
     
-    Serial.printf("Transfer complete: %u bytes\n", bytesSent);
+    float totalTime = (millis() - startTime) / 1000.0;
+    float averageSpeedMbps = (bytesSent * 8.0) / (totalTime * 1000000.0);
+    Serial.printf("\nTransfer complete:\n");
+    Serial.printf("Total bytes: %u\n", bytesSent);
+    Serial.printf("Time: %.1f seconds\n", totalTime);
+    Serial.printf("Average speed: %.2f Mbps\n", averageSpeedMbps);
 }
 
 void generate_wav_header(uint8_t *wav_header, uint32_t wav_size, uint32_t sample_rate) {
@@ -681,4 +743,12 @@ void loop() {
     frames_sent++;
     bytes_sent += compressed_buffer_size;
     last_frame_time = current_time;
+
+    if (wifi_active) {
+        server.handleClient();
+        checkServerStatus();
+    }
+
+    // Small delay to prevent watchdog issues
+    delay(1);
 }
