@@ -1,91 +1,112 @@
 #define CAMERA_MODEL_XIAO_ESP32S3
-#include <I2S.h>
+
+// Include all necessary libraries
+#include <driver/i2s.h>  // Main I2S driver
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
+#include "mulaw.h"
+
+// BLE includes
 #include <BLE2902.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
-#include "FS.h"
-#include "SD.h"
-#include "SPI.h"
-#include "mulaw.h"
+
+// WiFi and time includes
 #include <WiFi.h>
-#include "time.h"
-#include "ESP32Time.h"
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <esp_wifi.h>
+#include "time.h"
+#include "ESP32Time.h"
 
-//wifi for timestamp before BLE
+// Hardware Pin Definitions
+#define I2S_WS      D0    // I2S Word Select
+#define I2S_SCK     D1    // I2S Serial Clock
+#define I2S_SD      D2    // I2S Serial Data
+
+#define SD_CS_PIN   D3    // SD Card CS
+#define SD_MOSI_PIN D4    // SD Card MOSI
+#define SD_MISO_PIN D5    // SD Card MISO
+#define SD_SCK_PIN  D6    // SD Card SCK
+
+const int buttonPin1 = D7;  // First pushbutton
+const int buttonPin2 = D8;  // Second pushbutton
+const int motorPin = D9;    // Motor control
+
+// Audio Configuration
+#define SAMPLE_RATE 48000          // Sample rate in Hz
+#define SAMPLE_BITS 16             // Bits per sample
+#define FRAME_SIZE (SAMPLE_RATE / 100)  // 10ms frame size
+#define WAV_HEADER_SIZE 44         // WAV header size in bytes
+#define VOLUME_GAIN 2              // Audio volume multiplier
+
+// Buffer Configuration
+#define TRANSFER_BUFFER_SIZE 65536  // 64KB buffer for file transfers
+#define CHUNK_SIZE 32768           // 32KB chunks for file transfers
+static size_t recording_buffer_size = FRAME_SIZE * 2;  // 2 bytes per sample
+static size_t compressed_buffer_size = FRAME_SIZE * 2 + 3;  // Audio data + header
+
+// WiFi and Time Configuration
 const char* ssid = "mango";
 const char* password = "peterpeel";
 const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = -28800;     // Replace with your GMT offset (e.g., -25200 for PDT, -28800 for PST)
-const int   daylightOffset_sec = 0;  // 3600 for daylight savings, 0 for standard time
-bool timeInitialized = false;
-ESP32Time rtc;
+const long gmtOffset_sec = -28800;      // PST offset
+const int daylightOffset_sec = 0;      // No daylight savings
 
-//start/stop using terminal commands
-String inputString = "";      // String to hold incoming serial data
-bool stringComplete = false;  // Whether the string is complete
-bool isStreaming = false;  // New flag to control BLE streaming
-
-// WiFi server settings
+// WiFi Server Configuration
 const char* ap_ssid = "ESP32_Audio";
 const char* ap_password = "12345678";
-bool wifi_active = false;
-WebServer server(80);
-String currentWavFile = "";
-#define TRANSFER_BUFFER_SIZE 65536  // 64KB - Maximum practical buffer size
-#define CHUNK_SIZE 32768       // 32KB chunks for maximum throughput
-#define MAX_CLIENTS 1          // Limit to 1 client for maximum bandwidth
+#define MAX_CLIENTS 1               // Maximum simultaneous clients
 
-// Device and Service UUIDs
+// BLE Configuration
 #define DEVICE_NAME "ESP32WAV"
 static BLEUUID serviceUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
 static BLEUUID audioCharacteristicUUID("beb5483e-36e1-4688-b7f5-ea07361b26a8");
 
-// Audio codec configuration
-#define CODEC_PCM
+// Timing Constants
+const unsigned long FRAME_INTERVAL = 10;    // 10ms between frames
+const unsigned long STATS_INTERVAL = 1000;  // 1 second between stats
 
-// Fixed frame size for consistent buffering
-#define FRAME_SIZE 160
-#define SAMPLE_RATE 16000
-#define SAMPLE_BITS 16
-#define WAV_HEADER_SIZE 44
-#define SD_CS_PIN 21
-
-// BLE characteristic and connection state
+// Global Objects
+ESP32Time rtc;
+WebServer server(80);
 BLECharacteristic *audioCharacteristic;
-bool connected = false;
-uint16_t audio_frame_count = 0;
+File wavFile;
 
-// Fixed buffer sizes based on frame size
-static size_t recording_buffer_size = FRAME_SIZE * 2;  // 160 samples * 2 bytes per sample
-static size_t compressed_buffer_size = FRAME_SIZE * 2 + 3;  // Audio data + 3-byte header
-
-#define VOLUME_GAIN 2
-
+// Buffer Pointers
 static uint8_t *s_recording_buffer = nullptr;
 static uint8_t *s_compressed_frame = nullptr;
 
-// Timing control
-unsigned long last_frame_time = 0;
-unsigned long last_stats_time = 0;
-const unsigned long FRAME_INTERVAL = 10; // 10ms = 160 samples at 16kHz
-const unsigned long STATS_INTERVAL = 1000; // Print stats every second
+// State Variables
+bool timeInitialized = false;
+bool wifi_active = false;
+bool connected = false;        // BLE connection state
+bool isRecording = false;     // Recording state
+bool isStreaming = false;     // Streaming state
+bool stringComplete = false;  // Serial input state
 
-// Statistics
+// Button States
+int buttonState = 0;
+int lastButtonState = 1;
+int buttonState2 = 0;
+
+// Counters and Statistics
+uint16_t audio_frame_count = 0;
 unsigned long frames_sent = 0;
 unsigned long last_frames_sent = 0;
 unsigned long bytes_read = 0;
 unsigned long bytes_sent = 0;
 unsigned long frame_overruns = 0;
 unsigned long frame_underruns = 0;
+unsigned long last_frame_time = 0;
+unsigned long last_stats_time = 0;
 
-// SD card recording
-File wavFile;
-bool isRecording = false;
+// String Storage
+String inputString = "";       // Serial input buffer
+String currentWavFile = "";    // Current recording filename
 
 void setupWiFiDirect() {
     Serial.println("\nInitializing WiFi Direct...");
@@ -570,15 +591,41 @@ void configure_ble() {
                  SAMPLE_RATE, SAMPLE_BITS, FRAME_SIZE);
 }
 
+void motorFeedback() {
+    for (int i = 0; i < 2; i++) {
+        analogWrite(motorPin, 200);
+        delay(150);
+        analogWrite(motorPin, 0);
+        delay(100);
+    }
+}
+
+// Updated microphone configuration
 void configure_microphone() {
     Serial.println("Configuring microphone...");
-    // Configure I2S with explicit PDM settings
-    I2S.setAllPins(-1, 42, 41, -1, -1);
     
-    if (!I2S.begin(PDM_MONO_MODE, SAMPLE_RATE, SAMPLE_BITS)) {
-        Serial.println("Failed to initialize I2S!");
-        while (1); // do nothing
-    }
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = 0,
+        .dma_buf_count = 8,
+        .dma_buf_len = 512,
+        .use_apll = true
+    };
+
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+
+    const i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_SCK,
+        .ws_io_num = I2S_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = I2S_SD
+    };
+
+    i2s_set_pin(I2S_NUM_0, &pin_config);
 
     // Allocate buffers
     s_recording_buffer = (uint8_t *) ps_calloc(recording_buffer_size, sizeof(uint8_t));
@@ -586,16 +633,17 @@ void configure_microphone() {
     
     if (!s_recording_buffer || !s_compressed_frame) {
         Serial.println("Failed to allocate audio buffers!");
-        while (1); // do nothing
+        while (1);
     }
     
     Serial.printf("Microphone configured - Buffer sizes: Recording=%u bytes, Compressed=%u bytes\n", 
                  recording_buffer_size, compressed_buffer_size);
 }
 
+// Updated read_microphone function using proper I2S driver calls
 size_t read_microphone() {
     size_t bytes_recorded = 0;
-    esp_i2s::i2s_read(esp_i2s::I2S_NUM_0, s_recording_buffer, recording_buffer_size, &bytes_recorded, portMAX_DELAY);
+    i2s_read(I2S_NUM_0, s_recording_buffer, recording_buffer_size, &bytes_recorded, portMAX_DELAY);
     bytes_read += bytes_recorded;
     return bytes_recorded;
 }
@@ -603,10 +651,18 @@ size_t read_microphone() {
 void setup() {
     Serial.begin(921600);
     Serial.println("\n=== Starting BLE Audio Streaming ===");
-    inputString.reserve(200);  // Reserve 200 bytes for the inputString
+    inputString.reserve(200);
+    
+    // Initialize pins
+    pinMode(buttonPin1, INPUT_PULLUP);
+    pinMode(buttonPin2, INPUT_PULLUP);
+    pinMode(motorPin, OUTPUT);
+    
+    // Initialize SPI for SD card
+    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     
     // Set RTC time to compilation time
-    rtc.setTime(0, 0, 14, 22, 11, 2024);  // ss, mm, hh, dd, mm, yyyy
+    rtc.setTime(0, 0, 14, 22, 11, 2024);
     Serial.printf("RTC set to: %s\n", rtc.getTime("%Y-%m-%d_%H-%M-%S").c_str());
     
     if (!SD.begin(SD_CS_PIN)) {
@@ -615,16 +671,15 @@ void setup() {
     }
     Serial.println("SD Card mounted successfully");
     
-    setupWiFiDirect();  // This sets up the WiFi AP and server
-    configure_ble();    // This sets up BLE
-    configure_microphone();  // This sets up the microphone
+    setupWiFiDirect();
+    configure_ble();
+    configure_microphone();
     
     Serial.println("\nSetup complete - Ready for commands:");
     Serial.println("  start  - Start recording");
     Serial.println("  stop   - Stop recording");
     Serial.println("  status - Show current status");
     
-    // Add a delay to ensure all Serial messages are sent
     delay(100);
 }
 
@@ -632,6 +687,21 @@ void loop() {
     static uint8_t lastStationNum = 0;
     static unsigned long lastServerCheck = 0;
     unsigned long current_time = millis();
+    
+    // Read button states at the start of each loop
+    buttonState = digitalRead(buttonPin1);
+    buttonState2 = digitalRead(buttonPin2);
+
+    // Handle button press for recording control (non-blocking)
+    if (buttonState == LOW && lastButtonState == HIGH) {
+        motorFeedback();
+        if (!isStreaming && !isRecording) {
+            startRecording();
+        } else {
+            stopRecording();
+        }
+    }
+    lastButtonState = buttonState;
     
     // Check if we're actively transferring a file
     bool isTransferringFile = server.client() && server.client().connected();
@@ -642,8 +712,6 @@ void loop() {
         delay(1);  // Minimal delay to prevent WiFi stack issues
         return;    // Skip all other processing during file transfer
     }
-    
-    // Normal operation when not transferring files
     
     // Process serial commands with non-blocking approach
     while (Serial.available()) {
@@ -714,6 +782,7 @@ void loop() {
 
     // Write raw audio to SD card if recording is active
     if (isRecording) {
+        // Check button2 state to determine filename if needed
         if (wavFile.write(s_recording_buffer, recording_buffer_size) != recording_buffer_size) {
             Serial.println("Failed to write to SD card");
             // Consider stopping recording if write fails
