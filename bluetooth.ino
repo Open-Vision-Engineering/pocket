@@ -37,17 +37,24 @@ const int buttonPin2 = D8;  // Second pushbutton
 const int motorPin = D9;    // Motor control
 
 // Audio Configuration
-#define SAMPLE_RATE 48000          // Sample rate in Hz
+#define SAMPLE_RATE 48000          // Sample rate in Hz (for recording)
+#define BLE_SAMPLE_RATE 16000      // Sample rate for BLE streaming
 #define SAMPLE_BITS 16             // Bits per sample
-#define FRAME_SIZE (SAMPLE_RATE / 100)  // 10ms frame size
 #define WAV_HEADER_SIZE 44         // WAV header size in bytes
 #define VOLUME_GAIN 2              // Audio volume multiplier
 
-// Buffer Configuration
+// Frame and Buffer Configuration
+#define RECORDING_FRAME_SIZE (SAMPLE_RATE / 100)     // 480 samples for 48kHz
+#define BLE_FRAME_SIZE 160                           // Fixed size for BLE streaming
+#define BLE_MTU_SIZE 512                            // Maximum BLE packet size
+#define DOWNSAMPLE_FACTOR 3                         // 48kHz to 16kHz conversion
+
+// Buffer Sizes
 #define TRANSFER_BUFFER_SIZE 65536  // 64KB buffer for file transfers
 #define CHUNK_SIZE 32768           // 32KB chunks for file transfers
-static size_t recording_buffer_size = FRAME_SIZE * 2;  // 2 bytes per sample
-static size_t compressed_buffer_size = FRAME_SIZE * 2 + 3;  // Audio data + header
+const int BufferSizeInBytes = 1024;  // Recording buffer size for crystal clear audio
+static size_t recording_buffer_size = BufferSizeInBytes;
+static size_t compressed_buffer_size = BLE_FRAME_SIZE * 2 + 3;  // BLE frame + header
 
 // WiFi and Time Configuration
 const char* ssid = "mango";
@@ -588,7 +595,7 @@ void configure_ble() {
     Serial.println("BLE service started");
     Serial.printf("Device Name: %s\n", DEVICE_NAME);
     Serial.printf("Audio configuration: %dHz, %d-bit, Frame size: %d samples\n", 
-                 SAMPLE_RATE, SAMPLE_BITS, FRAME_SIZE);
+                 BLE_SAMPLE_RATE, SAMPLE_BITS, BLE_FRAME_SIZE);  // Changed from FRAME_SIZE to BLE_FRAME_SIZE
 }
 
 void motorFeedback() {
@@ -600,7 +607,6 @@ void motorFeedback() {
     }
 }
 
-// Updated microphone configuration
 void configure_microphone() {
     Serial.println("Configuring microphone...");
     
@@ -611,8 +617,8 @@ void configure_microphone() {
         .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = 0,
-        .dma_buf_count = 8,
-        .dma_buf_len = 512,
+        .dma_buf_count = 8,         // From working code
+        .dma_buf_len = 512,         // From working code
         .use_apll = true
     };
 
@@ -627,8 +633,8 @@ void configure_microphone() {
 
     i2s_set_pin(I2S_NUM_0, &pin_config);
 
-    // Allocate buffers
-    s_recording_buffer = (uint8_t *) ps_calloc(recording_buffer_size, sizeof(uint8_t));
+    // Allocate using the correct buffer size
+    s_recording_buffer = (uint8_t *) ps_calloc(BufferSizeInBytes, sizeof(uint8_t));
     s_compressed_frame = (uint8_t *) ps_calloc(compressed_buffer_size, sizeof(uint8_t));
     
     if (!s_recording_buffer || !s_compressed_frame) {
@@ -637,13 +643,13 @@ void configure_microphone() {
     }
     
     Serial.printf("Microphone configured - Buffer sizes: Recording=%u bytes, Compressed=%u bytes\n", 
-                 recording_buffer_size, compressed_buffer_size);
+                 BufferSizeInBytes, compressed_buffer_size);
 }
 
 // Updated read_microphone function using proper I2S driver calls
 size_t read_microphone() {
     size_t bytes_recorded = 0;
-    i2s_read(I2S_NUM_0, s_recording_buffer, recording_buffer_size, &bytes_recorded, portMAX_DELAY);
+    i2s_read(I2S_NUM_0, (void*)s_recording_buffer, BufferSizeInBytes, &bytes_recorded, portMAX_DELAY);
     bytes_read += bytes_recorded;
     return bytes_recorded;
 }
@@ -775,43 +781,43 @@ void loop() {
 
     // Read from mic
     size_t bytes_recorded = read_microphone();
-    if (bytes_recorded != recording_buffer_size) {
+    if (bytes_recorded != BufferSizeInBytes) {  // Changed to match the new buffer size
         Serial.printf("Unexpected bytes recorded: %d\n", bytes_recorded);
         return;
     }
 
     // Write raw audio to SD card if recording is active
     if (isRecording) {
-        // Check button2 state to determine filename if needed
-        if (wavFile.write(s_recording_buffer, recording_buffer_size) != recording_buffer_size) {
+        // Write to SD card
+        if (wavFile.write((const byte*)s_recording_buffer, bytes_recorded) != bytes_recorded) {
             Serial.println("Failed to write to SD card");
-            // Consider stopping recording if write fails
         }
+
+        // Process for BLE streaming - downsample to 16kHz for BLE
+        int16_t* samples = (int16_t*)s_recording_buffer;
+        uint8_t* output = s_compressed_frame + 3;
+        
+        // Take every third sample to downsample from 48kHz to 16kHz
+        for (size_t i = 0; i < BLE_FRAME_SIZE; i++) {
+            int16_t sample = samples[i * 3] << VOLUME_GAIN;  // Take every 3rd sample
+            *output++ = sample & 0xFF;         // Low byte
+            *output++ = (sample >> 8) & 0xFF;  // High byte
+        }
+
+        // Add frame header
+        s_compressed_frame[0] = audio_frame_count & 0xFF;
+        s_compressed_frame[1] = (audio_frame_count >> 8) & 0xFF;
+        s_compressed_frame[2] = 0;
+
+        // Send the audio data
+        audioCharacteristic->setValue(s_compressed_frame, compressed_buffer_size);
+        audioCharacteristic->notify();
+        
+        audio_frame_count++;
+        frames_sent++;
+        bytes_sent += compressed_buffer_size;
+        last_frame_time = current_time;
     }
-
-    // Process and send audio data
-    // Add frame header
-    s_compressed_frame[0] = audio_frame_count & 0xFF;
-    s_compressed_frame[1] = (audio_frame_count >> 8) & 0xFF;
-    s_compressed_frame[2] = 0;
-
-    // Process all samples with improved efficiency
-    int16_t* samples = (int16_t*)s_recording_buffer;
-    uint8_t* output = s_compressed_frame + 3;
-    for (size_t i = 0; i < FRAME_SIZE; i++) {
-        int16_t sample = samples[i] << VOLUME_GAIN;
-        *output++ = sample & 0xFF;         // Low byte
-        *output++ = (sample >> 8) & 0xFF;  // High byte
-    }
-
-    // Send the audio data
-    audioCharacteristic->setValue(s_compressed_frame, compressed_buffer_size);
-    audioCharacteristic->notify();
-    
-    audio_frame_count++;
-    frames_sent++;
-    bytes_sent += compressed_buffer_size;
-    last_frame_time = current_time;
 
     if (wifi_active) {
         server.handleClient();
