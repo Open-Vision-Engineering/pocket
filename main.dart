@@ -5,10 +5,12 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:http/http.dart' as http;
+import 'package:just_audio/just_audio.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:wifi_iot/wifi_iot.dart';
+import 'dart:math' show min, max;
 
 // Constants matching ESP32 configuration
 const String DEVICE_NAME = "ESP32WAV";
@@ -29,7 +31,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'BLE Audio Recorder',
+      title: 'BLE Audio Receiver',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
@@ -47,8 +49,6 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  BluetoothDevice? device;
-  BluetoothCharacteristic? audioCharacteristic;
   bool isScanning = false;
   bool isConnected = false;
   bool isRecording = false;
@@ -58,22 +58,43 @@ class _HomePageState extends State<HomePage> {
   DateTime? recordingStartTime;
   int framesReceived = 0;
   Timer? statusTimer;
+  BluetoothDevice? device;
+  BluetoothCharacteristic? audioCharacteristic;
+
+  // Audio player
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  bool isPlaying = false;
+  Duration? audioDuration;
+  Duration currentPosition = Duration.zero;
+  String? currentAudioFile;
+  Timer? positionTimer;
 
   // Recording statistics
   int frameDrops = 0;
   int outOfOrderFrames = 0;
   int invalidSizeFrames = 0;
   int lastFrameCount = -1;
+  bool dataReceived = false;
 
   @override
   void initState() {
     super.initState();
     _initBluetooth();
+
+    // Setup position updates for audio player
+    positionTimer = Timer.periodic(Duration(milliseconds: 200), (timer) async {
+      if (isPlaying) {
+        final position = await _audioPlayer.position;
+        setState(() => currentPosition = position);
+      }
+    });
   }
 
   @override
   void dispose() {
     statusTimer?.cancel();
+    positionTimer?.cancel();
+    _audioPlayer.dispose();
     device?.disconnect();
     super.dispose();
   }
@@ -84,6 +105,8 @@ class _HomePageState extends State<HomePage> {
     await Permission.bluetoothScan.request();
     await Permission.bluetoothConnect.request();
     await Permission.location.request();
+    await Permission.storage.request();
+    await Permission.audio.request();
 
     if (Platform.isAndroid) {
       await Permission.bluetoothAdvertise.request();
@@ -106,7 +129,7 @@ class _HomePageState extends State<HomePage> {
     });
 
     // Start scanning
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
+    await FlutterBluePlus.startScan(timeout: Duration(seconds: 10));
 
     // Listen to scan results
     FlutterBluePlus.scanResults.listen((results) async {
@@ -120,7 +143,7 @@ class _HomePageState extends State<HomePage> {
     });
 
     // After timeout
-    Future.delayed(const Duration(seconds: 10), () {
+    Future.delayed(Duration(seconds: 10), () {
       if (mounted && isScanning) {
         setState(() {
           isScanning = false;
@@ -154,7 +177,8 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         isConnected = true;
         isScanning = false;
-        statusMessage = "Connected to $DEVICE_NAME";
+        statusMessage =
+            "Connected to $DEVICE_NAME\nWaiting for recording to start...";
       });
     } catch (e) {
       setState(() {
@@ -166,9 +190,50 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> setupNotifications() async {
     await audioCharacteristic?.setNotifyValue(true);
-    audioCharacteristic?.lastValueStream.listen((value) {
-      if (isRecording) {
-        processAudioData(value);
+    audioCharacteristic?.value.listen((value) async {
+      if (!dataReceived) {
+        // First data packet received - recording has started
+        setState(() {
+          isRecording = true;
+          dataReceived = true;
+          recordingStartTime = DateTime.now();
+          statusMessage = "Recording started from ESP32...";
+          audioBuffer.clear();
+          framesReceived = 0;
+          frameDrops = 0;
+          outOfOrderFrames = 0;
+          invalidSizeFrames = 0;
+          lastFrameCount = -1;
+        });
+        startStatusUpdates();
+      }
+
+      if (value.isEmpty) {
+        // Recording stopped from ESP32
+        if (isRecording) {
+          await stopRecording();
+        }
+        return;
+      }
+
+      processAudioData(value);
+    });
+  }
+
+  void startStatusUpdates() {
+    statusTimer?.cancel();
+    statusTimer = Timer.periodic(Duration(seconds: 1), (timer) {
+      if (mounted && isRecording) {
+        setState(() {
+          Duration duration = DateTime.now().difference(recordingStartTime!);
+          double kbReceived = audioBuffer.length / 1024;
+          double fps = framesReceived / duration.inSeconds;
+          statusMessage = "Recording: ${duration.inSeconds}s\n"
+              "Received: ${kbReceived.toStringAsFixed(1)} KB\n"
+              "FPS: ${fps.toStringAsFixed(1)}\n"
+              "Drops: $frameDrops\n"
+              "Out of order: $outOfOrderFrames";
+        });
       }
     });
   }
@@ -203,40 +268,11 @@ class _HomePageState extends State<HomePage> {
     framesReceived++;
   }
 
-  Future<void> startRecording() async {
-    setState(() {
-      isRecording = true;
-      statusMessage = "Recording...";
-      audioBuffer.clear();
-      framesReceived = 0;
-      frameDrops = 0;
-      outOfOrderFrames = 0;
-      invalidSizeFrames = 0;
-      lastFrameCount = -1;
-      recordingStartTime = DateTime.now();
-    });
-
-    // Start periodic status updates
-    statusTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (mounted) {
-        setState(() {
-          Duration duration = DateTime.now().difference(recordingStartTime!);
-          double kbReceived = audioBuffer.length / 1024;
-          double fps = framesReceived / duration.inSeconds;
-          statusMessage = "Recording: ${duration.inSeconds}s\n"
-              "Received: ${kbReceived.toStringAsFixed(1)} KB\n"
-              "FPS: ${fps.toStringAsFixed(1)}\n"
-              "Drops: $frameDrops\n"
-              "Out of order: $outOfOrderFrames";
-        });
-      }
-    });
-  }
-
   Future<void> stopRecording() async {
     setState(() {
       isRecording = false;
-      statusMessage = "Stopped recording. Saving file...";
+      dataReceived = false;
+      statusMessage = "Recording stopped. Saving files...";
     });
 
     statusTimer?.cancel();
@@ -262,6 +298,7 @@ class _HomePageState extends State<HomePage> {
     sink.add(audioBuffer);
 
     await sink.close();
+    currentAudioFile = path;
     setState(() => statusMessage = "Saved BLE recording to: $path");
   }
 
@@ -348,38 +385,174 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> playAudio(String filePath) async {
+    try {
+      await _audioPlayer.setFilePath(filePath);
+      audioDuration = await _audioPlayer.duration;
+      await _audioPlayer.play();
+      setState(() {
+        isPlaying = true;
+        currentPosition = Duration.zero;
+      });
+    } catch (e) {
+      print("Error playing audio: $e");
+    }
+  }
+
+  Future<void> togglePlayPause() async {
+    if (currentAudioFile == null) return;
+
+    if (isPlaying) {
+      await _audioPlayer.pause();
+    } else {
+      await _audioPlayer.play();
+    }
+    setState(() => isPlaying = !isPlaying);
+  }
+
+  Future<void> stopPlaying() async {
+    await _audioPlayer.stop();
+    setState(() {
+      isPlaying = false;
+      currentPosition = Duration.zero;
+    });
+  }
+
+  String formatDuration(Duration duration) {
+    String twoDigits(int n) => n.toString().padLeft(2, '0');
+    String twoDigitMinutes = twoDigits(duration.inMinutes.remainder(60));
+    String twoDigitSeconds = twoDigits(duration.inSeconds.remainder(60));
+    return "$twoDigitMinutes:$twoDigitSeconds";
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('BLE Audio Recorder'),
+        title: Text('BLE Audio Receiver'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
       ),
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
-            Text(
-              statusMessage,
-              textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.bodyLarge,
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Text(
+                statusMessage,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodyLarge,
+              ),
             ),
             SizedBox(height: 20),
+
+            // Connection button
             if (!isConnected && !isScanning)
               ElevatedButton(
                 onPressed: startScan,
-                child: Text('Scan for Device'),
+                child: Text('Connect to Device'),
               ),
-            if (isConnected && !isRecording)
-              ElevatedButton(
-                onPressed: startRecording,
-                child: Text('Start Recording'),
+
+            // Audio player controls
+            if (currentAudioFile != null && !isRecording) ...[
+              SizedBox(height: 20),
+              Text('Audio Player',
+                  style: Theme.of(context).textTheme.titleLarge),
+              SizedBox(height: 10),
+
+              // Progress bar
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32),
+                child: Column(
+                  children: [
+                    Slider(
+                      value: currentPosition.inSeconds.toDouble(),
+                      max: audioDuration?.inSeconds.toDouble() ?? 0,
+                      onChanged: (value) async {
+                        final position = Duration(seconds: value.toInt());
+                        await _audioPlayer.seek(position);
+                        setState(() => currentPosition = position);
+                      },
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(formatDuration(currentPosition)),
+                          Text(formatDuration(audioDuration ?? Duration.zero)),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
               ),
-            if (isRecording)
-              ElevatedButton(
-                onPressed: stopRecording,
-                child: Text('Stop Recording'),
+
+              // Playback controls
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  IconButton(
+                    icon: Icon(Icons.replay_10),
+                    onPressed: () async {
+                      final newPosition = Duration(
+                          seconds: max(0, currentPosition.inSeconds - 10));
+                      await _audioPlayer.seek(newPosition);
+                    },
+                  ),
+                  IconButton(
+                    iconSize: 48,
+                    icon: Icon(
+                        isPlaying ? Icons.pause_circle : Icons.play_circle),
+                    onPressed: togglePlayPause,
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.forward_10),
+                    onPressed: () async {
+                      final newPosition = Duration(
+                          seconds: min((audioDuration?.inSeconds ?? 0),
+                              currentPosition.inSeconds + 10));
+                      await _audioPlayer.seek(newPosition);
+                    },
+                  ),
+                ],
               ),
+
+              // File selection buttons
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  ElevatedButton.icon(
+                    icon: Icon(Icons.bluetooth),
+                    label: Text('Play BLE Recording'),
+                    onPressed: () async {
+                      await stopPlaying();
+                      await playAudio(currentAudioFile!);
+                    },
+                  ),
+                  SizedBox(width: 16),
+                  ElevatedButton.icon(
+                    icon: Icon(Icons.sd_card),
+                    label: Text('Play SD Recording'),
+                    onPressed: () async {
+                      final directory =
+                          await getApplicationDocumentsDirectory();
+                      final files = directory
+                          .listSync()
+                          .where((f) => f.path.contains('sdcard_recording'))
+                          .toList();
+                      if (files.isNotEmpty) {
+                        final latestFile = files
+                            .map((f) => f.path)
+                            .reduce((a, b) => a.compareTo(b) > 0 ? a : b);
+                        await stopPlaying();
+                        await playAudio(latestFile);
+                      }
+                    },
+                  ),
+                ],
+              ),
+            ],
           ],
         ),
       ),
