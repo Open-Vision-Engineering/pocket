@@ -10,7 +10,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:wifi_iot/wifi_iot.dart';
-import 'dart:math' show min, max;
+import 'dart:math' as math;
 
 // Constants matching ESP32 configuration
 const String DEVICE_NAME = "ESP32WAV";
@@ -587,7 +587,7 @@ class _HomePageState extends State<HomePage> {
                     icon: Icon(Icons.replay_10),
                     onPressed: () async {
                       final newPosition = Duration(
-                          seconds: max(0, currentPosition.inSeconds - 10));
+                          seconds: math.max(0, currentPosition.inSeconds - 10));
                       await _audioPlayer.seek(newPosition);
                     },
                   ),
@@ -601,7 +601,7 @@ class _HomePageState extends State<HomePage> {
                     icon: Icon(Icons.forward_10),
                     onPressed: () async {
                       final newPosition = Duration(
-                          seconds: min((audioDuration?.inSeconds ?? 0),
+                          seconds: math.min((audioDuration?.inSeconds ?? 0),
                               currentPosition.inSeconds + 10));
                       await _audioPlayer.seek(newPosition);
                     },
