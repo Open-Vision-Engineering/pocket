@@ -189,9 +189,12 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> setupNotifications() async {
+    // Timer to detect gaps in data transmission
+    Timer? noDataTimer;
+
     await audioCharacteristic?.setNotifyValue(true);
     audioCharacteristic?.value.listen((value) async {
-      if (!dataReceived) {
+      if (!dataReceived && value.length > 3) {
         // First data packet received - recording has started
         setState(() {
           isRecording = true;
@@ -208,16 +211,27 @@ class _HomePageState extends State<HomePage> {
         startStatusUpdates();
       }
 
-      if (value.isEmpty) {
-        // Recording stopped from ESP32
+      // Reset or start the no-data timer
+      noDataTimer?.cancel();
+      noDataTimer = Timer(Duration(milliseconds: 500), () async {
         if (isRecording) {
+          print("No data received for 500ms, stopping recording");
           await stopRecording();
         }
+      });
+
+      if (value.isEmpty || value.length < 3) {
+        // Skip empty or invalid packets
         return;
       }
 
       processAudioData(value);
-    });
+    }, onError: (error) {
+      print("BLE notification error: $error");
+      if (isRecording) {
+        stopRecording();
+      }
+    }, cancelOnError: false);
   }
 
   void startStatusUpdates() {
@@ -239,10 +253,14 @@ class _HomePageState extends State<HomePage> {
   }
 
   void processAudioData(List<int> data) {
-    if (data.length < 3) return; // Ensure we have header
+    if (data.length < 3) {
+      print("Received invalid data length: ${data.length}");
+      return;
+    }
 
     // Parse frame count from header (first 2 bytes)
     int frameCount = data[0] | (data[1] << 8);
+    print("Processing frame #$frameCount, data length: ${data.length}");
 
     // Check for frame sequence continuity
     if (lastFrameCount != -1) {
@@ -252,6 +270,7 @@ class _HomePageState extends State<HomePage> {
         if (frameCount < lastFrameCount) {
           outOfOrderFrames++;
         }
+        print("Frame discontinuity: Expected $expectedFrame, Got $frameCount");
       }
     }
     lastFrameCount = frameCount;
@@ -261,11 +280,17 @@ class _HomePageState extends State<HomePage> {
     if (audioData.length != 320) {
       // 160 samples * 2 bytes per sample
       invalidSizeFrames++;
+      print("Invalid audio data size: ${audioData.length}");
       return;
     }
 
     audioBuffer.addAll(audioData);
     framesReceived++;
+
+    // Print buffer size periodically
+    if (framesReceived % 100 == 0) {
+      print("Current audio buffer size: ${audioBuffer.length} bytes");
+    }
   }
 
   Future<void> stopRecording() async {
@@ -290,41 +315,79 @@ class _HomePageState extends State<HomePage> {
         DateTime.now().toString().replaceAll(RegExp(r'[^0-9]'), '');
     final path = '${directory.path}/ble_recording_$timestamp.wav';
 
-    final file = File(path);
-    final sink = file.openWrite();
+    print("Saving WAV file to: $path");
+    print("Audio buffer size: ${audioBuffer.length} bytes");
 
-    // Write WAV header
-    sink.add(generateWavHeader(audioBuffer.length));
-    sink.add(audioBuffer);
+    try {
+      final file = File(path);
+      final sink = file.openWrite();
 
-    await sink.close();
-    currentAudioFile = path;
-    setState(() => statusMessage = "Saved BLE recording to: $path");
+      // Write WAV header
+      final header = generateWavHeader(audioBuffer.length);
+      sink.add(header);
+      print("Wrote WAV header: ${header.length} bytes");
+
+      // Write audio data
+      sink.add(audioBuffer);
+      print("Wrote audio data: ${audioBuffer.length} bytes");
+
+      await sink.flush();
+      await sink.close();
+
+      // Verify file was created
+      final savedFile = File(path);
+      if (await savedFile.exists()) {
+        final size = await savedFile.length();
+        print("WAV file saved successfully. Size: $size bytes");
+        currentAudioFile = path;
+        setState(() =>
+            statusMessage = "Saved BLE recording ($size bytes) to: $path");
+      } else {
+        print("Error: WAV file was not created");
+        setState(() => statusMessage = "Error saving WAV file");
+      }
+    } catch (e) {
+      print("Error saving WAV file: $e");
+      setState(() => statusMessage = "Error saving WAV file: $e");
+    }
   }
 
   Uint8List generateWavHeader(int dataSize) {
+    print("Generating WAV header for data size: $dataSize bytes");
     final header = ByteData(44); // WAV header is 44 bytes
+    final totalSize = 36 + dataSize;
 
-    // RIFF chunk descriptor
-    header.setUint32(0, 0x46464952, Endian.big); // 'RIFF'
-    header.setUint32(4, 36 + dataSize, Endian.little);
-    header.setUint32(8, 0x45564157, Endian.big); // 'WAVE'
+    try {
+      // RIFF chunk descriptor
+      header.setUint32(0, 0x52494646, Endian.big); // 'RIFF' in ASCII
+      header.setUint32(4, totalSize, Endian.little); // total file size - 8
+      header.setUint32(8, 0x57415645, Endian.big); // 'WAVE' in ASCII
 
-    // fmt sub-chunk
-    header.setUint32(12, 0x20746D66, Endian.big); // 'fmt '
-    header.setUint32(16, 16, Endian.little); // subchunk size
-    header.setUint16(20, 1, Endian.little); // PCM = 1
-    header.setUint16(22, 1, Endian.little); // Mono = 1 channel
-    header.setUint32(24, 16000, Endian.little); // Sample rate
-    header.setUint32(28, 32000, Endian.little); // Byte rate
-    header.setUint16(32, 2, Endian.little); // Block align
-    header.setUint16(34, 16, Endian.little); // Bits per sample
+      // fmt sub-chunk
+      header.setUint32(12, 0x666D7420, Endian.big); // 'fmt ' in ASCII
+      header.setUint32(16, 16, Endian.little); // subchunk size (16 for PCM)
+      header.setUint16(20, 1, Endian.little); // PCM = 1
+      header.setUint16(22, 1, Endian.little); // Mono = 1 channel
+      header.setUint32(24, 16000, Endian.little); // Sample rate: 16000 Hz
+      header.setUint32(
+          28,
+          32000,
+          Endian
+              .little); // Byte rate = SampleRate * NumChannels * BitsPerSample/8
+      header.setUint16(
+          32, 2, Endian.little); // Block align = NumChannels * BitsPerSample/8
+      header.setUint16(34, 16, Endian.little); // Bits per sample = 16
 
-    // data sub-chunk
-    header.setUint32(36, 0x61746164, Endian.big); // 'data'
-    header.setUint32(40, dataSize, Endian.little);
+      // data sub-chunk
+      header.setUint32(36, 0x64617461, Endian.big); // 'data' in ASCII
+      header.setUint32(40, dataSize, Endian.little); // data size
 
-    return header.buffer.asUint8List();
+      print("WAV header generated successfully");
+      return header.buffer.asUint8List();
+    } catch (e) {
+      print("Error generating WAV header: $e");
+      throw e;
+    }
   }
 
   Future<void> downloadFromESP32() async {
@@ -387,15 +450,43 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> playAudio(String filePath) async {
     try {
+      print("Attempting to play audio file: $filePath");
+
+      // Verify file exists and has content
+      final file = File(filePath);
+      if (!await file.exists()) {
+        print("Error: Audio file does not exist");
+        return;
+      }
+
+      final size = await file.length();
+      print("Audio file size: $size bytes");
+
+      if (size < 44) {
+        // Minimum size for a valid WAV file
+        print("Error: Audio file is too small to be valid");
+        return;
+      }
+
+      // Try to load and play the file
       await _audioPlayer.setFilePath(filePath);
       audioDuration = await _audioPlayer.duration;
+      print("Audio duration: $audioDuration");
+
+      if (audioDuration == null || audioDuration!.inMilliseconds == 0) {
+        print("Error: Invalid audio duration");
+        return;
+      }
+
       await _audioPlayer.play();
       setState(() {
         isPlaying = true;
         currentPosition = Duration.zero;
       });
-    } catch (e) {
+    } catch (e, stackTrace) {
       print("Error playing audio: $e");
+      print("Stack trace: $stackTrace");
+      setState(() => statusMessage = "Error playing audio: $e");
     }
   }
 
