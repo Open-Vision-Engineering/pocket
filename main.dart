@@ -6,11 +6,12 @@ import 'package:network_info_plus/network_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
+import 'package:share_plus/share_plus.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:wifi_iot/wifi_iot.dart';
-import 'dart:math' as math;
+import 'dart:math' show min, max;
 
 // Constants matching ESP32 configuration
 const String DEVICE_NAME = "ESP32WAV";
@@ -189,49 +190,58 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> setupNotifications() async {
-    // Timer to detect gaps in data transmission
     Timer? noDataTimer;
+    bool isFirstPacket = true;
+    DateTime? lastPacketTime;
 
     await audioCharacteristic?.setNotifyValue(true);
-    audioCharacteristic?.value.listen((value) async {
-      if (!dataReceived && value.length > 3) {
-        // First data packet received - recording has started
-        setState(() {
-          isRecording = true;
-          dataReceived = true;
-          recordingStartTime = DateTime.now();
-          statusMessage = "Recording started from ESP32...";
-          audioBuffer.clear();
-          framesReceived = 0;
-          frameDrops = 0;
-          outOfOrderFrames = 0;
-          invalidSizeFrames = 0;
-          lastFrameCount = -1;
+    audioCharacteristic?.value.listen(
+      (value) async {
+        // Update last packet time
+        lastPacketTime = DateTime.now();
+
+        // Cancel existing timer if any
+        noDataTimer?.cancel();
+
+        // Start new timer to detect end of stream
+        noDataTimer = Timer(Duration(milliseconds: 500), () async {
+          if (isRecording) {
+            print("No data received for 500ms, stopping recording");
+            await stopRecording();
+          }
         });
-        startStatusUpdates();
-      }
 
-      // Reset or start the no-data timer
-      noDataTimer?.cancel();
-      noDataTimer = Timer(Duration(milliseconds: 500), () async {
-        if (isRecording) {
-          print("No data received for 500ms, stopping recording");
-          await stopRecording();
+        // Handle first data packet
+        if (isFirstPacket && value.length >= 3) {
+          isFirstPacket = false;
+          setState(() {
+            isRecording = true;
+            dataReceived = true;
+            recordingStartTime = lastPacketTime;
+            statusMessage = "Recording started from ESP32...";
+            audioBuffer.clear();
+            framesReceived = 0;
+            frameDrops = 0;
+            outOfOrderFrames = 0;
+            invalidSizeFrames = 0;
+            lastFrameCount = -1;
+          });
+          startStatusUpdates();
         }
-      });
 
-      if (value.isEmpty || value.length < 3) {
-        // Skip empty or invalid packets
-        return;
-      }
-
-      processAudioData(value);
-    }, onError: (error) {
-      print("BLE notification error: $error");
-      if (isRecording) {
-        stopRecording();
-      }
-    }, cancelOnError: false);
+        // Process audio data if valid
+        if (value.length >= 3) {
+          processAudioData(value);
+        }
+      },
+      onError: (error) {
+        print("BLE notification error: $error");
+        if (isRecording) {
+          stopRecording();
+        }
+      },
+      cancelOnError: false,
+    );
   }
 
   void startStatusUpdates() {
@@ -294,6 +304,9 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> stopRecording() async {
+    if (!isRecording) return; // Prevent multiple stops
+
+    print("Stopping recording...");
     setState(() {
       isRecording = false;
       dataReceived = false;
@@ -302,10 +315,16 @@ class _HomePageState extends State<HomePage> {
 
     statusTimer?.cancel();
 
+    // Add a small delay to ensure all data is processed
+    await Future.delayed(Duration(milliseconds: 100));
+
     // Save the recorded audio buffer
     if (audioBuffer.isNotEmpty) {
+      print("Saving ${audioBuffer.length} bytes of audio data");
       await saveWavFile();
       await downloadFromESP32();
+    } else {
+      print("No audio data to save");
     }
   }
 
@@ -313,12 +332,18 @@ class _HomePageState extends State<HomePage> {
     final directory = await getApplicationDocumentsDirectory();
     final timestamp =
         DateTime.now().toString().replaceAll(RegExp(r'[^0-9]'), '');
-    final path = '${directory.path}/ble_recording_$timestamp.wav';
-
-    print("Saving WAV file to: $path");
-    print("Audio buffer size: ${audioBuffer.length} bytes");
+    final path = '${directory.path}/Recordings/ble_recording_$timestamp.wav';
 
     try {
+      // Create Recordings directory if it doesn't exist
+      final recordingsDir = Directory('${directory.path}/Recordings');
+      if (!await recordingsDir.exists()) {
+        await recordingsDir.create(recursive: true);
+      }
+
+      print("Saving WAV file to: $path");
+      print("Audio buffer size: ${audioBuffer.length} bytes");
+
       final file = File(path);
       final sink = file.openWrite();
 
@@ -335,13 +360,11 @@ class _HomePageState extends State<HomePage> {
       await sink.close();
 
       // Verify file was created
-      final savedFile = File(path);
-      if (await savedFile.exists()) {
-        final size = await savedFile.length();
+      if (await file.exists()) {
+        final size = await file.length();
         print("WAV file saved successfully. Size: $size bytes");
         currentAudioFile = path;
-        setState(() =>
-            statusMessage = "Saved BLE recording ($size bytes) to: $path");
+        setState(() => statusMessage = "Saved BLE recording ($size bytes)");
       } else {
         print("Error: WAV file was not created");
         setState(() => statusMessage = "Error saving WAV file");
@@ -390,62 +413,187 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> downloadFromESP32() async {
-    setState(() => statusMessage = "Connecting to ESP32 WiFi...");
+  Future<bool> _verifyESP32Connection() async {
+    try {
+      // Try to connect to ESP32's root page first
+      final testResponse = await http.get(
+        Uri.parse('http://$ESP_IP'),
+        headers: {'Connection': 'keep-alive'},
+      ).timeout(Duration(seconds: 5));
 
-    // Store current WiFi info
-    currentWifiSSID = await NetworkInfo().getWifiName();
+      return testResponse.statusCode == 200;
+    } catch (e) {
+      print("Connection verification failed: $e");
+      return false;
+    }
+  }
+
+  Future<bool> _waitForWiFiConnection() async {
+    bool connected = false;
+    int attempts = 0;
+    const maxAttempts = 10;
+
+    while (!connected && attempts < maxAttempts) {
+      attempts++;
+      print("Checking WiFi connection attempt $attempts/$maxAttempts");
+
+      try {
+        final currentSSID = await NetworkInfo().getWifiName();
+        print("Current WiFi network: $currentSSID");
+
+        if (currentSSID?.contains(ESP_WIFI_SSID) == true) {
+          // Give the connection a moment to stabilize
+          await Future.delayed(Duration(seconds: 2));
+
+          if (await _verifyESP32Connection()) {
+            connected = true;
+            print("Successfully connected to ESP32");
+            break;
+          }
+        }
+      } catch (e) {
+        print("Error checking WiFi connection: $e");
+      }
+
+      await Future.delayed(Duration(seconds: 1));
+    }
+
+    return connected;
+  }
+
+  Future<void> downloadFromESP32() async {
+    setState(() => statusMessage = "Preparing WiFi connection...");
 
     try {
-      // Connect to ESP32 WiFi
-      if (Platform.isAndroid) {
-        await WiFiForIoTPlugin.connect(ESP_WIFI_SSID,
-            password: ESP_WIFI_PASSWORD, security: NetworkSecurity.WPA);
-      } else if (Platform.isIOS) {
-        // For iOS, user needs to connect manually
-        showDialog(
+      if (Platform.isIOS) {
+        bool shouldContinue = true;
+
+        await showDialog(
           context: context,
+          barrierDismissible: false,
           builder: (context) => AlertDialog(
             title: Text("WiFi Connection Required"),
-            content: Text("Please connect to '$ESP_WIFI_SSID' "
-                "with password '$ESP_WIFI_PASSWORD' "
-                "in your WiFi settings."),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text("1. Open iOS Settings and connect to:"),
+                SizedBox(height: 8),
+                Text("Network: $ESP_WIFI_SSID",
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                Text("Password: $ESP_WIFI_PASSWORD",
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                SizedBox(height: 16),
+                Text("2. Dismiss the 'No Internet' warning"),
+                SizedBox(height: 16),
+                Text("3. Return to this app and tap 'Continue'"),
+              ],
+            ),
             actions: [
               TextButton(
-                child: Text("OK"),
+                child: Text("Cancel"),
+                onPressed: () {
+                  shouldContinue = false;
+                  Navigator.pop(context);
+                },
+              ),
+              TextButton(
+                child: Text("Continue"),
                 onPressed: () => Navigator.pop(context),
               ),
             ],
           ),
         );
-        await Future.delayed(Duration(seconds: 15)); // Wait for user
+
+        if (!shouldContinue) {
+          setState(() => statusMessage = "Download cancelled");
+          return;
+        }
+
+        setState(() => statusMessage = "Verifying WiFi connection...");
+
+        if (!await _waitForWiFiConnection()) {
+          setState(() => statusMessage = "Could not connect to ESP32");
+          return;
+        }
       }
 
-      // Download file
       setState(() => statusMessage = "Downloading from ESP32...");
-      final response = await http.get(Uri.parse('http://$ESP_IP/file'));
 
-      if (response.statusCode == 200) {
+      final response = await _retryDownload();
+
+      if (response != null) {
         final directory = await getApplicationDocumentsDirectory();
         final timestamp =
             DateTime.now().toString().replaceAll(RegExp(r'[^0-9]'), '');
-        final path = '${directory.path}/sdcard_recording_$timestamp.wav';
+        final path =
+            '${directory.path}/Recordings/sdcard_recording_$timestamp.wav';
+
+        // Ensure Recordings directory exists
+        final recordingsDir = Directory('${directory.path}/Recordings');
+        if (!await recordingsDir.exists()) {
+          await recordingsDir.create(recursive: true);
+        }
 
         await File(path).writeAsBytes(response.bodyBytes);
         setState(
             () => statusMessage = "Downloaded SD card recording to: $path");
-      } else {
-        setState(
-            () => statusMessage = "Download failed: ${response.statusCode}");
+
+        // Restore original WiFi connection
+        await restoreOriginalWifi();
       }
     } catch (e) {
+      print("Download error: $e");
       setState(() => statusMessage = "Download error: $e");
-    } finally {
-      // Restore original WiFi
-      if (Platform.isAndroid && currentWifiSSID != null) {
+    }
+  }
+
+  Future<void> restoreOriginalWifi() async {
+    if (Platform.isIOS) {
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text("Reconnect to Original Network"),
+          content: Text(
+              "Please reconnect to your original WiFi network in Settings."),
+          actions: [
+            TextButton(
+              child: Text("OK"),
+              onPressed: () => Navigator.pop(context),
+            ),
+          ],
+        ),
+      );
+    } else if (Platform.isAndroid) {
+      if (currentWifiSSID != null) {
         await WiFiForIoTPlugin.connect(currentWifiSSID!);
       }
     }
+  }
+
+  Future<http.Response?> _retryDownload() async {
+    for (int i = 0; i < 3; i++) {
+      try {
+        print("Download attempt ${i + 1}/3");
+        final response = await http.get(
+          Uri.parse('http://$ESP_IP/file'),
+          headers: {'Connection': 'keep-alive', 'Cache-Control': 'no-cache'},
+        ).timeout(Duration(seconds: 30));
+
+        if (response.statusCode == 200 && response.bodyBytes.length > 44) {
+          // Minimum WAV file size
+          print(
+              "Download successful, received ${response.bodyBytes.length} bytes");
+          return response;
+        }
+        print(
+            "Download attempt ${i + 1} failed with status: ${response.statusCode}");
+      } catch (e) {
+        print("Download attempt ${i + 1} failed: $e");
+        await Future.delayed(Duration(seconds: 2));
+      }
+    }
+    setState(() => statusMessage = "Download failed after 3 attempts");
+    return null;
   }
 
   Future<void> playAudio(String filePath) async {
@@ -507,6 +655,35 @@ class _HomePageState extends State<HomePage> {
       isPlaying = false;
       currentPosition = Duration.zero;
     });
+  }
+
+  Future<bool> hasRecordings() async {
+    final directory = await getApplicationDocumentsDirectory();
+    final recordingsDir = Directory('${directory.path}/Recordings');
+    if (!await recordingsDir.exists()) return false;
+
+    final files = await recordingsDir
+        .list()
+        .where((entity) => entity.path.endsWith('.wav'))
+        .toList();
+    return files.isNotEmpty;
+  }
+
+  Future<String?> getLatestRecording() async {
+    final directory = await getApplicationDocumentsDirectory();
+    final recordingsDir = Directory('${directory.path}/Recordings');
+    if (!await recordingsDir.exists()) return null;
+
+    final files = await recordingsDir
+        .list()
+        .where((entity) => entity.path.endsWith('.wav'))
+        .toList();
+
+    if (files.isEmpty) return null;
+
+    return files
+        .map((f) => f.path)
+        .reduce((a, b) => a.compareTo(b) > 0 ? a : b);
   }
 
   String formatDuration(Duration duration) {
@@ -587,7 +764,7 @@ class _HomePageState extends State<HomePage> {
                     icon: Icon(Icons.replay_10),
                     onPressed: () async {
                       final newPosition = Duration(
-                          seconds: math.max(0, currentPosition.inSeconds - 10));
+                          seconds: max(0, currentPosition.inSeconds - 10));
                       await _audioPlayer.seek(newPosition);
                     },
                   ),
@@ -601,7 +778,7 @@ class _HomePageState extends State<HomePage> {
                     icon: Icon(Icons.forward_10),
                     onPressed: () async {
                       final newPosition = Duration(
-                          seconds: math.min((audioDuration?.inSeconds ?? 0),
+                          seconds: min((audioDuration?.inSeconds ?? 0),
                               currentPosition.inSeconds + 10));
                       await _audioPlayer.seek(newPosition);
                     },
@@ -609,7 +786,7 @@ class _HomePageState extends State<HomePage> {
                 ],
               ),
 
-              // File selection buttons
+              // Recording selection buttons
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
@@ -626,22 +803,41 @@ class _HomePageState extends State<HomePage> {
                     icon: Icon(Icons.sd_card),
                     label: Text('Play SD Recording'),
                     onPressed: () async {
-                      final directory =
-                          await getApplicationDocumentsDirectory();
-                      final files = directory
-                          .listSync()
-                          .where((f) => f.path.contains('sdcard_recording'))
-                          .toList();
-                      if (files.isNotEmpty) {
-                        final latestFile = files
-                            .map((f) => f.path)
-                            .reduce((a, b) => a.compareTo(b) > 0 ? a : b);
+                      final latestFile = await getLatestRecording();
+                      if (latestFile != null) {
                         await stopPlaying();
                         await playAudio(latestFile);
                       }
                     },
                   ),
                 ],
+              ),
+
+              // Share button
+              FutureBuilder<bool>(
+                future: hasRecordings(),
+                builder: (context, snapshot) {
+                  if (snapshot.data == true) {
+                    return Column(
+                      children: [
+                        SizedBox(height: 20),
+                        ElevatedButton.icon(
+                          icon: Icon(Icons.share),
+                          label: Text('Share Recording'),
+                          onPressed: () async {
+                            final filePath =
+                                currentAudioFile ?? await getLatestRecording();
+                            if (filePath != null) {
+                              await Share.shareXFiles([XFile(filePath)],
+                                  text: 'Audio Recording from ESP32');
+                            }
+                          },
+                        ),
+                      ],
+                    );
+                  }
+                  return SizedBox.shrink();
+                },
               ),
             ],
           ],
